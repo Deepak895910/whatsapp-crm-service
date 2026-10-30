@@ -21,7 +21,7 @@ app.use((req, res, next) => {
   next();
 });
 
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT || 10000;
 const WA_SECRET = process.env.WA_SECRET || '';
 const CONFIG_FILE = path.join(__dirname, 'automation-config.json');
 
@@ -91,17 +91,14 @@ const getAuthenticatedUser = (req) => {
 
 // Enforce auth check on API routes (cookie session OR shared secret token)
 const authenticateApi = (req, res, next) => {
-  // Allow login/logout routes without auth
   if (req.path === '/login' || req.path === '/logout') {
     return next();
   }
 
-  // 1. Check Cookie-based browser session
   if (getAuthenticatedUser(req)) {
     return next();
   }
 
-  // 2. Check Shared secret (for cloud workers / automation backend)
   const secret = process.env.WA_SECRET || '';
   const reqSecret = req.headers['x-wa-secret'] ||
     (req.headers.authorization?.startsWith('Bearer ') ? req.headers.authorization.split(' ')[1] : null) ||
@@ -133,20 +130,14 @@ let client = null;
 let qrCodeData = null;
 let isReady = false;
 
-// Track phones that already received a greeting — only greet once per session
 const greetedPhones = new Set();
-
-// Per-sender conversation history: Map<phone, [{role, content}]>
 const conversationHistory = new Map();
-
-// Max messages to keep per conversation
 const MAX_HISTORY = 20;
 
 function addToHistory(phone, role, content) {
   if (!conversationHistory.has(phone)) conversationHistory.set(phone, []);
   const history = conversationHistory.get(phone);
   history.push({ role, content });
-  // Trim to max window
   if (history.length > MAX_HISTORY) history.splice(0, history.length - MAX_HISTORY);
 }
 
@@ -155,7 +146,6 @@ function clearHistory(phone) {
   greetedPhones.delete(phone);
 }
 
-// Clean up old conversations every 30 minutes
 setInterval(() => {
   conversationHistory.clear();
   greetedPhones.clear();
@@ -171,35 +161,38 @@ function initWhatsAppClient() {
 
   client = new Client({
     authStrategy: new LocalAuth({ dataPath: path.join(__dirname, '.ww-session') }),
-
-    // Never time out waiting for QR / auth — let the retry loop handle failures
-    authTimeoutMs: 0,
-    qrMaxRetries: 0,           // keep showing QR until scanned
-    takeoverOnConflict: true,  // take over if another session exists
+    authTimeoutMs: 60000,
+    qrMaxRetries: 0,
+    takeoverOnConflict: true,
     takeoverTimeoutMs: 10000,
 
-    // Cache WA web app locally to prevent slow loading and context destruction
+    // Dynamic cache to prevent outdated local file context destruction
     webVersionCache: {
-      type: 'local',
-      path: path.join(__dirname, '2.3000.1041627196.html')
+      type: 'remote',
+      remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.3000.1018944801-alpha.html',
     },
 
     puppeteer: {
       headless: true,
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium-browser',
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--no-first-run',
+        '--no-zygote',
+        '--single-process',
         '--disable-gpu',
         '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
       ],
-      timeout: 0,
+      timeout: 60000,
       protocolTimeout: 300000,
     },
   });
 
   client.on('qr', async (qr) => {
-    log('QR received — open http://localhost:' + PORT + '/ in browser to scan');
+    log('QR received — open browser to scan');
     qrCodeData = await qrcode.toDataURL(qr);
     isReady = false;
   });
@@ -215,17 +208,13 @@ function initWhatsAppClient() {
     isReady = true;
   });
 
-  // Forward incoming chat messages to the Worker Webhook if configured
   client.on('message', async (msg) => {
     try {
-      // 1. Forward message to webhook URL
       await forwardToBackend(msg);
 
-      // 2. AI Autoreply if enabled
       if (automationConfig.enabled && (automationConfig.openRouterApiKey || process.env.OPENROUTER_API_KEY)) {
         const senderPhone = msg.from.split('@')[0];
 
-        // Skip auto-reply for admin messages to prevent loops
         const adminPhone = (process.env.ADMIN_PHONE || '').replace(/\D/g, '');
         if (adminPhone && (senderPhone === adminPhone || adminPhone.endsWith(senderPhone) || senderPhone.endsWith(adminPhone))) {
           log(`Skipping AI reply for admin message from ${senderPhone}`);
@@ -235,18 +224,14 @@ function initWhatsAppClient() {
         const userText = (msg.body || msg.caption || '').trim();
         const msgLower = userText.toLowerCase();
 
-        // Handle stop/cancel — clear conversation and confirm
         if (['stop', 'cancel', 'exit', 'quit', 'reset'].includes(msgLower)) {
           clearHistory(senderPhone);
           try {
-            await client.sendMessage(msg.from,
-              `✅ Conversation reset. Feel free to start over anytime! 😊`
-            );
+            await client.sendMessage(msg.from, `✅ Conversation reset. Feel free to start over anytime! 😊`);
           } catch (e) { }
           return;
         }
 
-        // Track whether this is the first message from this sender
         const isFirstMessage = !greetedPhones.has(senderPhone);
         if (isFirstMessage) greetedPhones.add(senderPhone);
 
@@ -276,83 +261,60 @@ function getSystemPrompt() {
     if (fs.existsSync(filePath)) {
       return fs.readFileSync(filePath, 'utf8').trim();
     }
-  } catch (err) {
-    // ignore
-  }
+  } catch (err) { }
 
-  if (process.env.SYSTEM_PROMPT) {
-    return process.env.SYSTEM_PROMPT;
-  }
-
-  if (automationConfig.systemPrompt) {
-    return automationConfig.systemPrompt;
-  }
+  if (process.env.SYSTEM_PROMPT) return process.env.SYSTEM_PROMPT;
+  if (automationConfig.systemPrompt) return automationConfig.systemPrompt;
 
   return 'You are a helpful customer service AI assistant.';
 }
 
-// Generate response using OpenRouter and send reply
 async function handleAiAutoreply(msg, isFirstMessage = false) {
   const apiKey = automationConfig.openRouterApiKey || process.env.OPENROUTER_API_KEY;
-  // Free model fallback list — tries each in order if one fails
   const FREE_MODELS = [
     automationConfig.model && automationConfig.model !== 'openrouter/auto' ? automationConfig.model : null,
-    'openai/gpt-oss-120b',             // OpenAI gpt-oss-120b (free)
-    'poolside/laguna-m.1',             // Poolside Laguna M.1 (free)
-    'nvidia/nemotron-3-super',         // NVIDIA Nemotron 3 Super (free)
+    'openai/gpt-oss-120b',
+    'poolside/laguna-m.1',
+    'nvidia/nemotron-3-super',
     'google/gemma-3-27b-it:free',
     'qwen/qwen3-8b:free',
     'mistralai/mistral-7b-instruct:free'
   ].filter(Boolean);
+
   const basePrompt = getSystemPrompt();
   const senderPhone = msg.from.split('@')[0];
   const userText = (msg.body || msg.caption || '').trim();
 
   if (!userText) return;
 
-  // If no API key configured, notify the customer
   if (!apiKey) {
     log(`[AI Autoreply] No OpenRouter API key configured. Notifying customer ${senderPhone}.`);
     try {
-      await client.sendMessage(msg.from,
-        `⚠️ AI assistant is not configured yet.\n\nPlease insert a valid OpenRouter API key in the *Settings* to enable automated responses.`
-      );
+      await client.sendMessage(msg.from, `⚠️ AI assistant is not configured yet.\n\nPlease insert a valid OpenRouter API key in the *Settings* to enable automated responses.`);
     } catch (err) {
       log(`[AI Autoreply] Failed to send no-key notice: ${err.message}`);
     }
     return;
   }
 
-  // Build system prompt with booking instructions
   const greetingInstruction = isFirstMessage
     ? `\n\nThis is the customer's FIRST message. You may greet them briefly and naturally.`
-    : `\n\nIMPORTANT: This is NOT the customer's first message. Do NOT greet them. Do NOT say "Hi", "Hello", "I'm [name]", or any welcome phrase. Go straight to the point.`;
+    : `\n\nIMPORTANT: This is NOT the customer's first message. Do NOT greet them. Go straight to the point.`;
 
   const bookingInstruction = `
 
 BOOKING RULES — VERY IMPORTANT:
 - When a customer wants to book/appointment/schedule, ask for ALL required details in ONE SINGLE message:
   Name, Phone Number, Service/Request, and Preferred Date & Time.
-  Example: "Please share the following in one message:\n👤 Name:\n📞 Phone:\n🛠️ Service:\n📆 Date & Time:"
-- Do NOT ask for one field at a time. Always ask everything in one message.
-- Once the customer provides all the details, summarise them and ask for confirmation.
-- When the customer confirms (says "yes", "confirm", "ok", "correct", "done"), output this tag on its own line:
-  [BOOKING_CONFIRMED: name="...", phone="...", service="...", datetime="..."]
-- After the tag, send a friendly confirmation message.
-- If the customer says "cancel", "stop", "exit", or "no" to cancel, output: [CANCEL]
-- Remind the customer they can type *stop* or *cancel* anytime to exit.
-- Do NOT re-ask for details already provided in the conversation history.
-- Do NOT require vehicle/car info unless the business context specifically needs it.`;
+- Do NOT ask for one field at a time.
+- When confirmed, output: [BOOKING_CONFIRMED: name="...", phone="...", service="...", datetime="..."]
+- If customer wants to cancel, output: [CANCEL]`;
 
   const systemPrompt = basePrompt + greetingInstruction + bookingInstruction;
 
-  // Add user message to history
   addToHistory(senderPhone, 'user', userText);
-
-  // Build messages array with full history
   const history = conversationHistory.get(senderPhone) || [];
 
-  // Try each free model in order until one succeeds
   let replyText = '';
   let usedModel = '';
   for (const model of FREE_MODELS) {
@@ -373,6 +335,7 @@ BOOKING RULES — VERY IMPORTANT:
           ]
         })
       });
+
       if (res.ok) {
         const aiData = await res.json();
         const text = aiData?.choices?.[0]?.message?.content;
@@ -380,12 +343,7 @@ BOOKING RULES — VERY IMPORTANT:
           replyText = text;
           usedModel = model;
           break;
-        } else if (aiData?.error) {
-          log(`[AI Autoreply] Model ${model} error: ${aiData.error.message || JSON.stringify(aiData.error)}`);
         }
-      } else {
-        const errText = await res.text();
-        log(`[AI Autoreply] Model ${model} failed (${res.status}): ${errText.slice(0, 120)}`);
       }
     } catch (err) {
       log(`[AI Autoreply] Model ${model} threw: ${err.message}`);
@@ -397,66 +355,40 @@ BOOKING RULES — VERY IMPORTANT:
     return;
   }
 
-  log(`[AI Autoreply] Got reply from ${usedModel} for ${senderPhone}.`);
-
   try {
-    // ── Check for CANCEL tag ──────────────────────────────────────────────
     if (replyText.includes('[CANCEL]')) {
       clearHistory(senderPhone);
-      const cleanReply = replyText.replace('[CANCEL]', '').trim() ||
-        `No problem! Conversation cancelled. Type anything to start again. 😊`;
+      const cleanReply = replyText.replace('[CANCEL]', '').trim() || `No problem! Conversation cancelled. Type anything to start again. 😊`;
       await client.sendMessage(msg.from, cleanReply);
-      log(`[AI Autoreply] Conversation cancelled for ${senderPhone}.`);
       return;
     }
 
-    // ── Check for BOOKING_CONFIRMED tag ──────────────────────────────────
     const bookingTagRegex = /\[BOOKING_CONFIRMED:\s*name="([^"]*)",\s*phone="([^"]*)",\s*service="([^"]*)",\s*datetime="([^"]*)"\]/i;
     const bookingMatch = replyText.match(bookingTagRegex);
     if (bookingMatch) {
       const [, bName, bPhone, bService, bDatetime] = bookingMatch;
       const cleanReply = replyText.replace(bookingTagRegex, '').replace(/\n{3,}/g, '\n\n').trim();
 
-      // Resolve the real WA link — use bPhone if senderPhone is a @lid internal ID
       const isLid = (msg.from || '').includes('@lid');
-      const waLinkPhone = isLid
-        ? bPhone.replace(/\D/g, '')       // use customer's provided phone
-        : senderPhone;                     // use real @c.us number
+      const waLinkPhone = isLid ? bPhone.replace(/\D/g, '') : senderPhone;
 
-      // Notify admin
       const adminPhone = (process.env.ADMIN_PHONE || '').replace(/\D/g, '');
       if (adminPhone && client) {
         const adminJid = `${adminPhone}@c.us`;
-        const adminMsg =
-          `📅 *New Booking Request!*\n` +
-          `─────────────────\n` +
-          `👤 *Name:* ${bName}\n` +
-          `📞 *Phone:* ${bPhone}\n` +
-          `🛠️ *Service:* ${bService}\n` +
-          `📆 *Date/Time:* ${bDatetime}\n` +
-          `─────────────────\n` +
-          `💬 *Customer WA:* wa.me/${waLinkPhone}`;
+        const adminMsg = `📅 *New Booking Request!*\n─────────────────\n👤 *Name:* ${bName}\n📞 *Phone:* ${bPhone}\n🛠️ *Service:* ${bService}\n📆 *Date/Time:* ${bDatetime}\n─────────────────\n💬 *Customer WA:* wa.me/${waLinkPhone}`;
         try {
           await client.sendMessage(adminJid, adminMsg);
-          log(`[Booking] Forwarded booking from ${senderPhone} to admin ${adminPhone}`);
-        } catch (e) {
-          log(`[Booking] Failed to notify admin: ${e.message}`);
-        }
+        } catch (e) { }
       }
 
-      // Send confirmation to customer and clear history
       await client.sendMessage(msg.from, cleanReply || `✅ Your booking is confirmed! We'll contact you shortly. 😊`);
       clearHistory(senderPhone);
-      log(`[Booking] Booking confirmed and history cleared for ${senderPhone}.`);
       return;
     }
 
-    // ── Normal AI reply ───────────────────────────────────────────────────
     addToHistory(senderPhone, 'assistant', replyText);
     await client.sendMessage(msg.from, replyText);
-    log(`[AI Autoreply] Sent response to ${senderPhone} via ${usedModel}: "${replyText.replace(/\n/g, ' ').slice(0, 100)}"`);
 
-    // Forward AI reply to webhook
     await forwardToBackend({
       from: (client.info?.wid?._serialized) || 'system@c.us',
       body: replyText,
@@ -464,10 +396,9 @@ BOOKING RULES — VERY IMPORTANT:
       hasMedia: false
     });
   } catch (err) {
-    log(`[AI Autoreply] Error processing reply for ${senderPhone}: ${err.message}`);
+    log(`[AI Autoreply] Error processing reply: ${err.message}`);
   }
 }
-
 
 function _reconnect() {
   log('Reconnecting in 5 s...');
@@ -484,21 +415,17 @@ function _reconnect() {
   }, 5000);
 }
 
-// Remove stale Chromium lock files left after a crash/restart
-function _clearChromiumLocks() {
-  // Can be implemented if needed for the deployment platform
-}
+function _clearChromiumLocks() { }
 
 let initAttempt = 0;
 function _initWithRetry(attempt) {
   initAttempt = attempt;
   if (attempt > 8) {
-    log('Init failed after 8 retries. Container may lack WA network access.');
+    log('Init failed after 8 retries.');
     return;
   }
 
   _clearChromiumLocks();
-
   log(`Initializing WhatsApp client (attempt ${attempt + 1}/9)...`);
 
   if (!client) {
@@ -509,7 +436,6 @@ function _initWithRetry(attempt) {
     const msg = err.message || err.toString();
     log(`Init error details: ${msg}`);
 
-    // Destroy the current client to kill the browser process and prevent locks
     const oldClient = client;
     client = null;
     if (oldClient) {
@@ -518,78 +444,9 @@ function _initWithRetry(attempt) {
       } catch (e) { }
     }
 
-    if (msg.includes('already running')) {
-      log('Browser lock conflict. Clearing locks and retrying in 3s...');
-      _clearChromiumLocks();
-      setTimeout(() => _initWithRetry(attempt + 1), 3000);
-    } else if (msg.includes('net::ERR_TIMED_OUT') || msg.includes('ERR_TIMED_OUT')) {
-      log(`Network ERR_TIMED_OUT. Retrying in 5s...`);
-      setTimeout(() => _initWithRetry(attempt + 1), 5000);
-    } else if (
-      msg.includes('TIMED_OUT') ||
-      msg.includes('net::ERR') ||
-      msg.includes('auth timeout') ||
-      msg.includes('timeout')
-    ) {
-      log(`Timeout (${msg.slice(0, 80)}). Retrying in 10s...`);
-      setTimeout(() => _initWithRetry(attempt + 1), 10000);
-    } else {
-      log('Init error: ' + msg);
-      setTimeout(() => _initWithRetry(attempt + 1), 5000);
-    }
+    setTimeout(() => _initWithRetry(attempt + 1), 5000);
   });
 }
-
-// Run quick network diagnostic checks for web.whatsapp.com
-async function runDiagnostics() {
-  const dns = require('dns').promises;
-  const https = require('https');
-  log('--- Starting Network Diagnostics ---');
-
-  if (process.env.PROXY_SERVER) {
-    const redactedProxy = process.env.PROXY_SERVER.replace(/:[^:@]+@/, ':***@');
-    log(`Proxy Configured: ${redactedProxy}`);
-  } else {
-    log(`Proxy Configured: None`);
-  }
-
-  try {
-    const addresses = await dns.resolve4('web.whatsapp.com');
-    log(`DNS: web.whatsapp.com resolved to: ${addresses.join(', ')}`);
-  } catch (err) {
-    log(`DNS: Failed to resolve web.whatsapp.com: ${err.message}`);
-  }
-
-  const start = Date.now();
-  try {
-    await new Promise((resolve, reject) => {
-      const reqObj = https.get('https://web.whatsapp.com', {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
-        }
-      }, (response) => {
-        log(`HTTPS: Connected to web.whatsapp.com. Status: ${response.statusCode} (took ${Date.now() - start}ms)`);
-        resolve();
-      });
-      reqObj.on('error', (err) => {
-        log(`HTTPS: Failed to connect to web.whatsapp.com: ${err.message} (took ${Date.now() - start}ms)`);
-        reject(err);
-      });
-      reqObj.setTimeout(10000, () => {
-        reqObj.destroy();
-        log(`HTTPS: Connection to web.whatsapp.com timed out after 10s`);
-        reject(new Error('Timeout'));
-      });
-    });
-  } catch (err) {
-    // Logged inside the handlers
-  }
-  log('------------------------------------');
-}
-
-runDiagnostics().finally(() => {
-  _initWithRetry(0);
-});
 
 // ─── Authentication Routes ────────────────────────────────────────────────────
 app.get('/login', (req, res) => {
@@ -605,7 +462,7 @@ app.post('/api/login', (req, res) => {
   const expectedPass = process.env.AUTH_PASSWORD || 'password';
 
   if (username === expectedUser && password === expectedPass) {
-    const expiry = Date.now() + 7 * 24 * 60 * 60 * 1000; // 7 days expiry
+    const expiry = Date.now() + 7 * 24 * 60 * 60 * 1000;
     const payload = `${username}|${expiry}`;
     const signature = crypto
       .createHmac('sha256', process.env.WA_SECRET || 'fallback_secret')
@@ -633,7 +490,6 @@ app.get('/', (req, res) => {
   res.redirect('/login');
 });
 
-// ─── Sender client UI ─────────────────────────────────────────────────────────
 app.get('/client', authenticateUi, (req, res) => {
   res.sendFile(path.join(__dirname, 'whatsapp-client.html'));
 });
@@ -660,7 +516,6 @@ app.get('/api/automation/config', authenticateApi, (req, res) => {
 
 app.post('/api/automation/config', authenticateApi, (req, res) => {
   const { enabled, systemPrompt, openRouterApiKey, model } = req.body;
-
   if (enabled !== undefined) automationConfig.enabled = !!enabled;
   if (systemPrompt !== undefined) automationConfig.systemPrompt = systemPrompt;
   if (openRouterApiKey !== undefined) automationConfig.openRouterApiKey = openRouterApiKey;
@@ -671,57 +526,6 @@ app.post('/api/automation/config', authenticateApi, (req, res) => {
     res.json({ success: true, config: automationConfig });
   } else {
     res.status(500).json({ error: 'Failed to save configuration file' });
-  }
-});
-
-app.get('/debug', authenticateApi, async (req, res) => {
-  const dns = require('dns').promises;
-  const https = require('https');
-  const results = {};
-
-  try {
-    const addresses = await dns.resolve4('web.whatsapp.com');
-    results.dns = { success: true, addresses };
-  } catch (err) {
-    results.dns = { success: false, error: err.message };
-  }
-
-  const start = Date.now();
-  try {
-    const reqObj = https.get('https://web.whatsapp.com', (response) => {
-      results.http = {
-        success: true,
-        statusCode: response.statusCode,
-        timeMs: Date.now() - start
-      };
-      res.json(results);
-    });
-
-    reqObj.on('error', (err) => {
-      results.http = {
-        success: false,
-        error: err.message,
-        timeMs: Date.now() - start
-      };
-      res.json(results);
-    });
-
-    reqObj.setTimeout(5000, () => {
-      reqObj.destroy();
-      results.http = {
-        success: false,
-        error: 'Timeout after 5s',
-        timeMs: Date.now() - start
-      };
-      res.json(results);
-    });
-  } catch (err) {
-    results.http = {
-      success: false,
-      error: err.message,
-      timeMs: Date.now() - start
-    };
-    res.json(results);
   }
 });
 
@@ -742,20 +546,6 @@ app.get('/api/chats', async (req, res) => {
           timestamp: chat.lastMessage.timestamp,
           type: chat.lastMessage.type
         };
-      } else {
-        try {
-          const msgs = await chat.fetchMessages({ limit: 1 });
-          if (msgs && msgs.length > 0) {
-            lastMsg = {
-              body: msgs[0].body,
-              fromMe: msgs[0].fromMe,
-              timestamp: msgs[0].timestamp,
-              type: msgs[0].type
-            };
-          }
-        } catch (err) {
-          // ignore
-        }
       }
       return {
         id: chat.id._serialized,
@@ -768,7 +558,6 @@ app.get('/api/chats', async (req, res) => {
     }));
     res.json(chatList);
   } catch (err) {
-    log('Get chats error: ' + err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -777,12 +566,10 @@ app.get('/api/chats/:jid/messages', async (req, res) => {
   if (!isReady) {
     return res.status(503).json({ error: 'WhatsApp client is not ready.' });
   }
-  const jid = req.params.jid;
   try {
-    const chat = await client.getChatById(jid);
+    const chat = await client.getChatById(req.params.jid);
     const messages = await chat.fetchMessages({ limit: 50 });
-
-    const mappedMessages = messages.map(msg => ({
+    res.json(messages.map(msg => ({
       id: msg.id.id,
       body: msg.body,
       from: msg.from,
@@ -791,10 +578,8 @@ app.get('/api/chats/:jid/messages', async (req, res) => {
       timestamp: msg.timestamp,
       type: msg.type,
       hasMedia: msg.hasMedia
-    }));
-    res.json(mappedMessages);
+    })));
   } catch (err) {
-    log(`Get messages for ${jid} error: ` + err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -803,13 +588,10 @@ app.post('/api/chats/:jid/messages', async (req, res) => {
   if (!isReady) {
     return res.status(503).json({ error: 'WhatsApp client is not ready.' });
   }
-  const jid = req.params.jid;
   const { message } = req.body;
-  if (!message) {
-    return res.status(400).json({ error: 'message content is required' });
-  }
+  if (!message) return res.status(400).json({ error: 'message content is required' });
   try {
-    const sentMsg = await client.sendMessage(jid, message);
+    const sentMsg = await client.sendMessage(req.params.jid, message);
     res.json({
       success: true,
       message: {
@@ -823,7 +605,6 @@ app.post('/api/chats/:jid/messages', async (req, res) => {
       }
     });
   } catch (err) {
-    log(`Send message to ${jid} error: ` + err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -842,12 +623,8 @@ app.post('/api/send-message', async (req, res) => {
     let targetJid = `${withCountry}@c.us`;
     try {
       const numberId = await client.getNumberId(withCountry);
-      if (numberId) {
-        targetJid = numberId._serialized;
-      }
-    } catch (err) {
-      log(`Warning: getNumberId failed for ${withCountry}: ${err.message}. Falling back to standard JID.`);
-    }
+      if (numberId) targetJid = numberId._serialized;
+    } catch (err) { }
 
     const { MessageMedia } = require('whatsapp-web.js');
     let mediaToSend = null;
@@ -863,21 +640,15 @@ app.post('/api/send-message', async (req, res) => {
           const buffer = Buffer.from(arrayBuffer);
           const mime = response.headers.get('content-type') || 'image/jpeg';
           mediaToSend = new MessageMedia(mime, buffer.toString('base64'), filename || 'file');
-        } else {
-          log(`Failed to fetch media URL: ${urlToUse}, status: ${response.status}`);
         }
-      } catch (e) {
-        log(`Error fetching media URL: ${e.message}`);
-      }
+      } catch (e) { }
     }
 
     if (mediaToSend) {
       await client.sendMessage(targetJid, mediaToSend, { caption: message || '' });
-      log(`Media message sent to ${phone}`);
     } else {
       if (!message) return res.status(400).json({ error: 'message required if no media' });
       await client.sendMessage(targetJid, message);
-      log(`Text message sent to ${phone}`);
     }
     res.json({ success: true });
   } catch (err) {
@@ -896,36 +667,19 @@ app.post('/api/broadcast', async (req, res) => {
     return res.status(503).json({ error: 'WhatsApp client is not ready.' });
   }
   const { contacts, message, template, delay, interval } = req.body;
-  if (!contacts || !Array.isArray(contacts)) {
-    return res.status(400).json({ error: 'contacts array is required' });
-  }
+  if (!contacts || !Array.isArray(contacts)) return res.status(400).json({ error: 'contacts array is required' });
 
   const msgText = message || template || '';
-  if (!msgText) {
-    return res.status(400).json({ error: 'message template content is required' });
-  }
+  if (!msgText) return res.status(400).json({ error: 'message template content is required' });
 
   const delaySec = parseInt(delay || interval || 5, 10);
-
   res.json({ success: true, message: `Started background broadcast to ${contacts.length} contacts.` });
 
-  // Run in background
   (async () => {
-    log(`[API Broadcast] Starting background broadcast to ${contacts.length} contacts...`);
     for (let i = 0; i < contacts.length; i++) {
       const contact = contacts[i];
-      let phone = '';
-
-      if (typeof contact === 'string' || typeof contact === 'number') {
-        phone = String(contact);
-      } else if (contact && typeof contact === 'object') {
-        phone = String(contact.phone || contact.Phone || contact.number || '');
-      }
-
-      if (!phone) {
-        log(`[API Broadcast] Row #${i + 1}: Skipped (No phone number)`);
-        continue;
-      }
+      let phone = typeof contact === 'string' || typeof contact === 'number' ? String(contact) : contact?.phone || contact?.number || '';
+      if (!phone) continue;
 
       let msgToSend = msgText;
       if (contact && typeof contact === 'object') {
@@ -942,29 +696,20 @@ app.post('/api/broadcast', async (req, res) => {
 
         try {
           const numberId = await client.getNumberId(withCountry);
-          if (numberId) {
-            targetJid = numberId._serialized;
-          }
+          if (numberId) targetJid = numberId._serialized;
         } catch (e) { }
 
         await client.sendMessage(targetJid, msgToSend);
-        log(`[API Broadcast] Sent message to +${withCountry}`);
-      } catch (err) {
-        log(`[API Broadcast] Failed to send message to ${phone}: ${err.message}`);
-      }
+      } catch (err) { }
 
       if (i < contacts.length - 1) {
-        const variance = (Math.random() * 0.4 - 0.2) * delaySec;
-        const finalDelay = Math.max(1, delaySec + variance) * 1000;
-        await new Promise(resolve => setTimeout(resolve, finalDelay));
+        await new Promise(r => setTimeout(r, delaySec * 1000));
       }
     }
-    log(`[API Broadcast] Completed background broadcast.`);
   })();
 });
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
-
 async function forwardToBackend(msg) {
   const backendUrl = process.env.BACKEND_URL;
   if (!backendUrl) return;
@@ -973,23 +718,6 @@ async function forwardToBackend(msg) {
   const senderPhone = fromJid.split('@')[0];
 
   try {
-    let mediaData = null;
-    if (msg.hasMedia && typeof msg.downloadMedia === 'function') {
-      try {
-        const media = await msg.downloadMedia();
-        if (media) {
-          mediaData = {
-            mimetype: media.mimetype,
-            data: media.data,
-            filename: media.filename
-          };
-        }
-      } catch (err) {
-        console.error('Failed to download message media for forward:', err.message);
-      }
-    }
-
-    log(`Forwarding message from ${senderPhone} to backend webhook...`);
     await fetch(backendUrl, {
       method: 'POST',
       headers: {
@@ -1001,13 +729,10 @@ async function forwardToBackend(msg) {
         cnumber: senderPhone,
         body: msg.body || msg.caption || '',
         hasMedia: !!msg.hasMedia,
-        type: msg.type || 'chat',
-        media: mediaData
+        type: msg.type || 'chat'
       })
     });
-  } catch (e) {
-    log(`Failed to forward webhook to ${backendUrl}: ${e.message}`);
-  }
+  } catch (e) { }
 }
 
 function log(msg) {
@@ -1023,43 +748,28 @@ function startKeepAlive() {
     return;
   }
 
-  const intervalMinutes = parseFloat(process.env.KEEP_ALIVE_INTERVAL_MINUTES) || 45;
+  const intervalMinutes = parseFloat(process.env.KEEP_ALIVE_INTERVAL_MINUTES) || 10;
   const intervalMs = intervalMinutes * 60 * 1000;
 
-  const headers = {};
-  const hfToken = process.env.HF_TOKEN || process.env.HF_API_TOKEN;
-  if (hfToken) {
-    headers['Authorization'] = `Bearer ${hfToken}`;
-    log('Keep-alive: Using token for self-ping authentication.');
-  }
-
   log(`Keep-alive: Starting self-ping to ${url} every ${intervalMinutes} minutes.`);
-
-  const sendPing = (type) => {
-    log(`Keep-alive: Sending ${type} ping to ${url}...`);
+  const sendPing = () => {
     try {
       const clientModule = url.startsWith('https') ? https : http;
-      const options = {
-        headers: headers,
-        timeout: 10000
-      };
-
-      clientModule.get(url, options, (res) => {
-        log(`Keep-alive: ${type} ping response status code: ${res.statusCode}`);
+      clientModule.get(url, { timeout: 10000 }, (res) => {
+        log(`Keep-alive: Ping response: ${res.statusCode}`);
       }).on('error', (err) => {
-        log(`Keep-alive: ${type} ping request failed. Error: ${err.message}`);
+        log(`Keep-alive error: ${err.message}`);
       });
-    } catch (err) {
-      log(`Keep-alive: ${type} ping error: ${err.message}`);
-    }
+    } catch (err) { }
   };
 
-  setTimeout(() => sendPing('initial'), 10000);
-  setInterval(() => sendPing('periodic'), intervalMs);
+  setTimeout(sendPing, 10000);
+  setInterval(sendPing, intervalMs);
 }
 
+// ─── Start Server ─────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  log(`WhatsApp service running on http://localhost:${PORT}`);
-  log('Open the URL above in a browser to scan QR code on first run');
+  log(`WhatsApp service running on port ${PORT}`);
   startKeepAlive();
+  _initWithRetry(0);
 });
