@@ -1,32 +1,54 @@
 FROM node:18-bullseye-slim
 
-# Prevent Puppeteer from downloading Chromium during npm install
-ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
-
-# Install Git (required for dependency retrieval), Chromium, and DNS utilities
-RUN apt-get update && apt-get install -y \
-    git \
-    chromium \
-    chromium-sandbox \
-    libnss3 \
-    libxss1 \
-    libasound2 \
-    libatk-bridge2.0-0 \
-    libgtk-3-0 \
-    dnsmasq \
-    && rm -rf /var/lib/apt/lists/*
-
 WORKDIR /app
 
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    chromium \
+    ca-certificates \
+    fonts-liberation \
+    libappindicator3-1 \
+    libasound2 \
+    libatk-bridge2.0-0 \
+    libatk1.0-0 \
+    libc6 \
+    libcairo2 \
+    libcups2 \
+    libdbus-1-3 \
+    libexpat1 \
+    libfontconfig1 \
+    libgbm1 \
+    libgcc1 \
+    libglib2.0-0 \
+    libgtk-3-0 \
+    libnspr4 \
+    libnss3 \
+    libpango-1.0-0 \
+    libpangocairo-1.0-0 \
+    libstdc++6 \
+    libx11-6 \
+    libx11-xcb1 \
+    libxcb1 \
+    libxcomposite1 \
+    libxcursor1 \
+    libxdamage1 \
+    libxext6 \
+    libxfixes3 \
+    libxi6 \
+    libxrandr2 \
+    libxrender1 \
+    libxss1 \
+    libxtst6 \
+    lsb-release \
+    wget \
+    xdg-utils \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY package*.json ./
-RUN npm install --production
+RUN npm install
 
 COPY . .
 
-EXPOSE 7860
+ENV PORT=10000
+EXPOSE 10000
 
-ENV PORT=7860
-ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
-ENV NODE_OPTIONS="--max-old-space-size=512"
-
-CMD ["node", "server.js"]
+CMD ["npm", "start"]
