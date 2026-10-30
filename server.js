@@ -12,6 +12,7 @@ const crypto = require('crypto');
 const app = express();
 app.use(cors({ origin: '*' }));
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 // Log incoming requests (excluding frequent status checks)
 app.use((req, res, next) => {
@@ -91,7 +92,7 @@ const getAuthenticatedUser = (req) => {
 
 // Enforce auth check on API routes (cookie session OR shared secret token)
 const authenticateApi = (req, res, next) => {
-  if (req.path === '/login' || req.path === '/logout') {
+  if (req.path === '/login' || req.path === '/logout' || req.path === '/api/pair-phone') {
     return next();
   }
 
@@ -129,6 +130,7 @@ if (!fs.existsSync(LOGS_DIR)) fs.mkdirSync(LOGS_DIR, { recursive: true });
 let client = null;
 let qrCodeData = null;
 let isReady = false;
+let currentPairingCode = null;
 
 const greetedPhones = new Set();
 const conversationHistory = new Map();
@@ -162,7 +164,6 @@ function initWhatsAppClient() {
   client = new Client({
     authStrategy: new LocalAuth({ dataPath: path.join(__dirname, '.ww-session') }),
     authTimeoutMs: 60000,
-    qrMaxRetries: 0,
     takeoverOnConflict: true,
     takeoverTimeoutMs: 10000,
 
@@ -173,9 +174,12 @@ function initWhatsAppClient() {
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
+        '--disable-gpu',
         '--disable-accelerated-2d-canvas',
         '--no-first-run',
-        '--disable-gpu',
+        '--js-flags="--max-old-space-size=256"',
+        '--disable-extensions',
+        '--mute-audio',
         '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
       ],
       timeout: 60000,
@@ -184,19 +188,21 @@ function initWhatsAppClient() {
   });
 
   client.on('qr', async (qr) => {
-    log('QR received — open browser to scan');
+    log('QR received — scan or request pairing code');
     qrCodeData = await qrcode.toDataURL(qr);
     isReady = false;
   });
 
   client.on('authenticated', () => {
-    log('WhatsApp authenticated');
+    log('WhatsApp authenticated successfully');
     qrCodeData = null;
+    currentPairingCode = null;
   });
 
   client.on('ready', () => {
     log('WhatsApp connected and ready!');
     qrCodeData = null;
+    currentPairingCode = null;
     isReady = true;
   });
 
@@ -407,8 +413,6 @@ function _reconnect() {
   }, 5000);
 }
 
-function _clearChromiumLocks() { }
-
 let initAttempt = 0;
 function _initWithRetry(attempt) {
   initAttempt = attempt;
@@ -417,7 +421,6 @@ function _initWithRetry(attempt) {
     return;
   }
 
-  _clearChromiumLocks();
   log(`Initializing WhatsApp client (attempt ${attempt + 1}/9)...`);
 
   if (!client) {
@@ -489,11 +492,131 @@ app.get('/chat', authenticateUi, (req, res) => {
   res.sendFile(path.join(__dirname, 'whatsapp-client.html'));
 });
 
-// ─── API ──────────────────────────────────────────────────────────────────────
-app.get('/status', authenticateApi, (req, res) => {
+// ─── Phone Number Pairing API ────────────────────────────────────────────────
+app.post('/api/pair-phone', async (req, res) => {
+  const { phone } = req.body;
+  if (!phone) {
+    return res.status(400).json({ error: 'Phone number is required' });
+  }
+
+  if (!client) {
+    return res.status(503).json({ error: 'WhatsApp client is still starting up. Please wait 10 seconds.' });
+  }
+
+  try {
+    const cleanedNumber = phone.toString().replace(/\D/g, '');
+    const fullNumber = cleanedNumber.length === 10 ? '91' + cleanedNumber : cleanedNumber;
+
+    log(`[Pairing] Requesting 8-digit pairing code for +${fullNumber}...`);
+    const code = await client.requestPairingCode(fullNumber);
+    currentPairingCode = code;
+    log(`[Pairing] Successfully generated pairing code: ${code}`);
+
+    res.json({
+      success: true,
+      code: code,
+      phone: fullNumber,
+      message: 'Enter this code in WhatsApp -> Linked Devices -> Link with phone number'
+    });
+  } catch (err) {
+    log(`[Pairing] Failed to generate code: ${err.message}`);
+    res.status(500).json({ error: err.message || 'Failed to request pairing code' });
+  }
+});
+
+// ─── Direct Pairing Form Page ────────────────────────────────────────────────
+app.get('/pair', (req, res) => {
+  res.send(`
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <title>WhatsApp Phone Pairing</title>
+      <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; background-color: #f0f2f5; }
+        .card { background: white; padding: 2.5rem; border-radius: 16px; box-shadow: 0 10px 25px rgba(0,0,0,0.08); text-align: center; max-width: 420px; width: 90%; }
+        h2 { margin-top: 0; color: #1e293b; }
+        p { color: #64748b; font-size: 0.95rem; line-height: 1.5; }
+        input { width: 100%; box-sizing: border-box; padding: 12px 16px; border: 2px solid #e2e8f0; border-radius: 8px; font-size: 1.05rem; margin: 15px 0; outline: none; transition: border-color 0.2s; }
+        input:focus { border-color: #25d366; }
+        button { width: 100%; background: #25d366; color: white; border: none; padding: 14px; border-radius: 8px; font-size: 1rem; font-weight: 600; cursor: pointer; transition: background 0.2s; }
+        button:hover { background: #1eb956; }
+        .code-box { display: none; margin-top: 20px; padding: 15px; background: #f8fafc; border: 2px dashed #cbd5e1; border-radius: 8px; }
+        .code-text { font-size: 2rem; letter-spacing: 4px; font-weight: 700; color: #0f172a; margin: 10px 0; font-family: monospace; }
+        .badge { display: inline-block; padding: 4px 12px; border-radius: 20px; font-size: 0.8rem; font-weight: 600; margin-bottom: 12px; }
+        .badge-ready { background: #dcfce7; color: #16a34a; }
+        .badge-wait { background: #fef3c7; color: #d97706; }
+      </style>
+    </head>
+    <body>
+      <div class="card">
+        <div class="badge ${isReady ? 'badge-ready' : 'badge-wait'}">
+          ${isReady ? '✓ WhatsApp Connected' : 'Status: Waiting for Connection'}
+        </div>
+        <h2>Link with Phone Number</h2>
+        <p>Enter your 10-digit WhatsApp number to receive an 8-digit linking code.</p>
+        
+        <input type="text" id="phone" placeholder="e.g. 9301530783" />
+        <button id="btn" onclick="getCode()">Get Pairing Code</button>
+
+        <div id="result" class="code-box">
+          <p style="margin: 0; color: #475569; font-weight: 500;">Enter this code on your phone:</p>
+          <div class="code-text" id="displayCode">----</div>
+          <p style="font-size: 0.85rem; color: #64748b; margin-bottom: 0;">Open WhatsApp &gt; Linked Devices &gt; Link with phone number instead</p>
+        </div>
+      </div>
+
+      <script>
+        async function getCode() {
+          const phoneInput = document.getElementById('phone');
+          const btn = document.getElementById('btn');
+          const result = document.getElementById('result');
+          const displayCode = document.getElementById('displayCode');
+
+          if (!phoneInput.value.trim()) {
+            alert('Please enter a phone number');
+            return;
+          }
+
+          btn.disabled = true;
+          btn.innerText = 'Requesting Code...';
+
+          try {
+            const res = await fetch('/api/pair-phone', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ phone: phoneInput.value.trim() })
+            });
+
+            const data = await res.json();
+            if (data.success && data.code) {
+              displayCode.innerText = data.code;
+              result.style.display = 'block';
+              btn.innerText = 'Code Received!';
+            } else {
+              alert('Error: ' + (data.error || 'Failed to get code'));
+              btn.disabled = false;
+              btn.innerText = 'Get Pairing Code';
+            }
+          } catch (e) {
+            alert('Connection failed: ' + e.message);
+            btn.disabled = false;
+            btn.innerText = 'Get Pairing Code';
+          }
+        }
+      </script>
+    </body>
+    </html>
+  `);
+});
+
+// ─── API Routes ───────────────────────────────────────────────────────────────
+app.get('/status', (req, res) => {
   res.json({
     ready: isReady,
     qr: qrCodeData,
+    pairingCode: currentPairingCode,
     waSecret: WA_SECRET,
     username: process.env.AUTH_USER || 'admin'
   });
@@ -523,7 +646,7 @@ app.post('/api/automation/config', authenticateApi, (req, res) => {
 
 app.get('/api/chats', async (req, res) => {
   if (!isReady) {
-    return res.status(503).json({ error: 'WhatsApp client is not ready. Scan the QR code first.', ready: false });
+    return res.status(503).json({ error: 'WhatsApp client is not ready. Link your phone first.', ready: false });
   }
   try {
     const chats = await client.getChats();
