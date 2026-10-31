@@ -22,7 +22,7 @@ const {
 const app = express();
 app.use(cors({ origin: '*' }));
 
-// High resolution images aur PDF documents ke liye 50MB payload limit
+// 50MB payload limit taaki heavy PDFs ya images na rukein
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
@@ -74,6 +74,7 @@ app.get('/status', (req, res) => {
   });
 });
 
+// Full Dashboard UI with Testing Console
 app.get('/scan', requireAuth, (req, res) => {
   res.send(`
     <!DOCTYPE html>
@@ -84,7 +85,7 @@ app.get('/scan', requireAuth, (req, res) => {
       <title>WhatsApp Engine Panel</title>
       <style>
         body { font-family: system-ui, -apple-system, sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; background: #0b141a; color: #e9edef; }
-        .card { background: #111b21; padding: 28px; border-radius: 16px; box-shadow: 0 8px 24px rgba(0,0,0,0.5); width: 100%; max-width: 420px; text-align: center; border: 1px solid #222d34; }
+        .card { background: #111b21; padding: 28px; border-radius: 16px; box-shadow: 0 8px 24px rgba(0,0,0,0.5); width: 100%; max-width: 440px; text-align: center; border: 1px solid #222d34; }
         h2 { margin-top: 0; font-size: 20px; color: #00a884; }
         .status-badge { display: inline-block; padding: 6px 14px; border-radius: 20px; font-size: 13px; font-weight: 600; margin-bottom: 14px; }
         .badge-loading { background: #3b4a54; color: #aebac1; }
@@ -93,7 +94,7 @@ app.get('/scan', requireAuth, (req, res) => {
         img { width: 220px; height: 220px; display: block; }
         .test-box { margin-top: 20px; padding-top: 18px; border-top: 1px solid #222d34; text-align: left; }
         label { font-size: 12px; color: #8696a0; display: block; margin-bottom: 4px; }
-        input { width: 100%; padding: 10px; margin-bottom: 12px; border-radius: 6px; border: 1px solid #2a3942; background: #202c33; color: white; box-sizing: border-box; font-size: 14px; }
+        input { width: 100%; padding: 10px; margin-bottom: 12px; border-radius: 6px; border: 1px solid #2a3942; background: #202c33; color: white; box-sizing: border-box; font-size: 14px; outline: none; }
         button { width: 100%; background: #00a884; color: #111b21; border: none; padding: 12px; border-radius: 8px; font-weight: bold; cursor: pointer; font-size: 15px; }
         button:hover { background: #06cf9c; }
         #resStatus { margin-top: 10px; font-size: 13px; font-weight: bold; text-align: center; }
@@ -111,8 +112,8 @@ app.get('/scan', requireAuth, (req, res) => {
         </div>
 
         <div class="test-box">
-          <label>Target Phone Number</label>
-          <input type="text" id="testPhone" value="8959102057" />
+          <label>Target Phone Number (10 Digits)</label>
+          <input type="text" id="testPhone" value="9301530783" />
 
           <label>Message Content</label>
           <input type="text" id="testMsg" value="Namaste! WhatsApp Automation Active & Running!" />
@@ -209,27 +210,38 @@ app.post('/api/send-message', async (req, res) => {
     if (cleaned.length === 10) cleaned = '91' + cleaned;
     const jid = `${cleaned}@s.whatsapp.net`;
 
-    if (fileBase64) {
-      const base64Data = fileBase64.replace(/^data:([A-Za-z-+/0-9]+);base64,/, '');
-      const buffer = Buffer.from(base64Data, 'base64');
+    if (fileBase64 && fileBase64.length > 50) {
+      // Data-URI coma separator se pure Base64 extract karein
+      let pureBase64 = fileBase64;
+      if (pureBase64.includes(',')) {
+        pureBase64 = pureBase64.split(',')[1];
+      }
+      pureBase64 = pureBase64.trim().replace(/\s+/g, '');
+
+      // Binary buffer creation
+      const buffer = Buffer.from(pureBase64, 'base64');
 
       if (fileType === 'image') {
-        // WhatsApp Image format
+        // Image photo format
         await sock.sendMessage(jid, {
           image: buffer,
           caption: message || ''
         });
       } else {
-        // WhatsApp Document format (PDF)
+        // Original PDF Document format
+        const finalName = fileName 
+          ? (fileName.endsWith('.pdf') ? fileName : `${fileName}.pdf`) 
+          : 'Fee_Receipt.pdf';
+
         await sock.sendMessage(jid, {
           document: buffer,
           mimetype: 'application/pdf',
-          fileName: fileName || 'Fee_Receipt.pdf',
+          fileName: finalName,
           caption: message || ''
         });
       }
     } else {
-      // Standard Text message
+      // Normal Text Message
       await sock.sendMessage(jid, { text: message });
     }
 
@@ -308,6 +320,7 @@ async function startBaileys() {
   }
 }
 
+// Keep-alive ping (Server ko sone se rokne ke liye)
 setInterval(() => {
   const publicUrl = process.env.PUBLIC_URL;
   if (publicUrl) {
