@@ -26,6 +26,8 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 10000;
 const WA_SECRET = process.env.WA_SECRET || '89599301';
+const AUTH_USER = process.env.AUTH_USER || 'admin';
+const AUTH_PASS = process.env.AUTH_PASS || '89599301';
 const SESSION_DIR = path.join(__dirname, 'baileys_auth');
 
 if (!fs.existsSync(SESSION_DIR)) {
@@ -37,12 +39,32 @@ let qrCodeData = null;
 let isReady = false;
 let isConnecting = false;
 
-// Homepage redirect to Scan Page
+// ─── Basic Auth Middleware (Browser Login Popup Lock) ─────────────────────────
+function requireAuth(req, res, next) {
+  const authHeader = req.headers.authorization;
+
+  if (!authHeader) {
+    res.setHeader('WWW-Authenticate', 'Basic realm="WhatsApp Secure Area"');
+    return res.status(401).send('Authentication required');
+  }
+
+  const base64Credentials = authHeader.split(' ')[1] || '';
+  const credentials = Buffer.from(base64Credentials, 'base64').toString('utf8');
+  const [user, pass] = credentials.split(':');
+
+  if (user === AUTH_USER && pass === AUTH_PASS) {
+    return next();
+  }
+
+  res.setHeader('WWW-Authenticate', 'Basic realm="WhatsApp Secure Area"');
+  return res.status(401).send('Invalid username or password');
+}
+
+// ─── Public Routes ────────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
   res.redirect('/scan');
 });
 
-// JSON Status Endpoint
 app.get('/status', (req, res) => {
   res.json({
     ready: isReady,
@@ -51,47 +73,53 @@ app.get('/status', (req, res) => {
   });
 });
 
-// Live QR Code Scan UI
-app.get('/scan', (req, res) => {
+// ─── Protected Routes (Scan & Test Panel with Lock) ────────────────────────────
+app.get('/scan', requireAuth, (req, res) => {
   res.send(`
     <!DOCTYPE html>
     <html lang="en">
     <head>
       <meta charset="UTF-8">
       <meta name="viewport" content="width=device-width, initial-scale=1.0">
-      <title>WhatsApp QR Connect</title>
+      <title>WhatsApp Engine Panel</title>
       <style>
         body { font-family: system-ui, -apple-system, sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; background: #0b141a; color: #e9edef; }
-        .card { background: #111b21; padding: 32px; border-radius: 16px; box-shadow: 0 8px 24px rgba(0,0,0,0.5); width: 100%; max-width: 380px; text-align: center; border: 1px solid #222d34; }
-        h2 { margin-top: 0; font-size: 22px; color: #00a884; }
-        .qr-box { background: white; padding: 16px; border-radius: 12px; display: inline-block; margin: 16px 0; min-width: 250px; min-height: 250px; }
-        img { width: 250px; height: 250px; display: block; }
-        .status-badge { display: inline-block; padding: 6px 14px; border-radius: 20px; font-size: 13px; font-weight: 600; margin-bottom: 12px; }
+        .card { background: #111b21; padding: 28px; border-radius: 16px; box-shadow: 0 8px 24px rgba(0,0,0,0.5); width: 100%; max-width: 420px; text-align: center; border: 1px solid #222d34; }
+        h2 { margin-top: 0; font-size: 20px; color: #00a884; }
+        .status-badge { display: inline-block; padding: 6px 14px; border-radius: 20px; font-size: 13px; font-weight: 600; margin-bottom: 14px; }
         .badge-loading { background: #3b4a54; color: #aebac1; }
         .badge-ready { background: #00a884; color: #111b21; }
-        .instructions { font-size: 14px; color: #8696a0; line-height: 1.6; text-align: left; margin-top: 14px; background: #1f2c34; padding: 14px; border-radius: 8px; }
-        .instructions b { color: #e9edef; }
-        button { background: #00a884; color: #111b21; border: none; padding: 10px 18px; border-radius: 8px; font-weight: 700; cursor: pointer; margin-top: 12px; }
+        .qr-box { background: white; padding: 12px; border-radius: 12px; display: inline-block; margin: 12px 0; }
+        img { width: 220px; height: 220px; display: block; }
+        .test-box { margin-top: 20px; padding-top: 18px; border-top: 1px solid #222d34; text-align: left; }
+        label { font-size: 12px; color: #8696a0; display: block; margin-bottom: 4px; }
+        input { width: 100%; padding: 10px; margin-bottom: 12px; border-radius: 6px; border: 1px solid #2a3942; background: #202c33; color: white; box-sizing: border-box; font-size: 14px; }
+        button { width: 100%; background: #00a884; color: #111b21; border: none; padding: 12px; border-radius: 8px; font-weight: bold; cursor: pointer; font-size: 15px; }
         button:hover { background: #06cf9c; }
+        #resStatus { margin-top: 10px; font-size: 13px; font-weight: bold; text-align: center; }
       </style>
     </head>
     <body>
       <div class="card">
-        <h2>WhatsApp Link</h2>
-        <div id="badge" class="status-badge badge-loading">Loading QR...</div>
+        <h2>WhatsApp Automation Server</h2>
+        <div id="badge" class="status-badge badge-loading">Checking connection...</div>
         
-        <div class="qr-box" id="qrContainer">
-          <p style="color:#667781; padding-top: 100px;">Generating QR Code...</p>
+        <div id="qrSection">
+          <div class="qr-box" id="qrContainer">
+            <p style="color:#667781; padding: 60px 0;">Loading QR...</p>
+          </div>
         </div>
 
-        <div class="instructions">
-          1. Mobile phone me <b>WhatsApp</b> kholein<br>
-          2. Menu (3 dots ya Settings) ➔ <b>Linked Devices</b><br>
-          3. <b>Link a device</b> par tap karein<br>
-          4. Is QR code ko apne camera se <b>Scan karein</b>
-        </div>
+        <div class="test-box">
+          <label>Target Phone Number</label>
+          <input type="text" id="testPhone" value="8959102057" />
 
-        <button onclick="resetSession()">Reset & New QR</button>
+          <label>Message Content</label>
+          <input type="text" id="testMsg" value="Namaste! WhatsApp Automation Active & Running!" />
+
+          <button id="sendBtn" onclick="sendTestMsg()">Send Test Message</button>
+          <div id="resStatus"></div>
+        </div>
       </div>
 
       <script>
@@ -100,28 +128,59 @@ app.get('/scan', (req, res) => {
             const res = await fetch('/status');
             const data = await res.json();
             const badge = document.getElementById('badge');
+            const qrSec = document.getElementById('qrSection');
             const container = document.getElementById('qrContainer');
 
             if (data.ready) {
               badge.className = 'status-badge badge-ready';
               badge.innerText = 'Connected & Active';
-              container.innerHTML = '<div style="color:#00a884; font-weight:bold; padding-top:100px; font-size:18px;">✅ WhatsApp Connected!</div>';
-            } else if (data.qr) {
+              qrSec.style.display = 'none';
+            } else {
               badge.className = 'status-badge badge-loading';
-              badge.innerText = 'Scan QR Code Now';
-              container.innerHTML = '<img src="' + data.qr + '" alt="Scan QR" />';
+              badge.innerText = 'Waiting for QR Scan';
+              qrSec.style.display = 'block';
+              if (data.qr) {
+                container.innerHTML = '<img src="' + data.qr + '" alt="QR" />';
+              }
             }
           } catch(e) {}
         }
 
-        async function resetSession() {
-          if (confirm('Kya aap naya QR generate karna chahte hain?')) {
-            await fetch('/api/reset-session', { method: 'POST' });
-            location.reload();
+        async function sendTestMsg() {
+          const btn = document.getElementById('sendBtn');
+          const resBox = document.getElementById('resStatus');
+          const phone = document.getElementById('testPhone').value.trim();
+          const message = document.getElementById('testMsg').value.trim();
+
+          btn.disabled = true;
+          btn.innerText = 'Sending...';
+          resBox.innerText = '';
+
+          try {
+            const res = await fetch('/api/send-message?secret=' + '${WA_SECRET}', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ phone, message })
+            });
+
+            const data = await res.json();
+            if (data.success) {
+              resBox.style.color = '#00a884';
+              resBox.innerText = '✅ Message Successfully Delivered!';
+            } else {
+              resBox.style.color = '#ff3b30';
+              resBox.innerText = 'Error: ' + (data.error || 'Failed');
+            }
+          } catch(err) {
+            resBox.style.color = '#ff3b30';
+            resBox.innerText = 'Error: ' + err.message;
+          } finally {
+            btn.disabled = false;
+            btn.innerText = 'Send Test Message';
           }
         }
 
-        setInterval(checkStatus, 2500);
+        setInterval(checkStatus, 3000);
         checkStatus();
       </script>
     </body>
@@ -129,24 +188,7 @@ app.get('/scan', (req, res) => {
   `);
 });
 
-// Reset Session Endpoint
-app.post('/api/reset-session', async (req, res) => {
-  try {
-    isReady = false;
-    qrCodeData = null;
-    if (sock) {
-      try { sock.end(); } catch (e) {}
-    }
-    fs.rmSync(SESSION_DIR, { recursive: true, force: true });
-    fs.mkdirSync(SESSION_DIR, { recursive: true });
-    setTimeout(startBaileys, 1000);
-    res.json({ success: true, message: 'Session reset complete' });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Send Message Endpoint (Next.js backend compatibility)
+// ─── Send Message API (Protected by Secret Key) ───────────────────────────────
 app.post('/api/send-message', async (req, res) => {
   const reqSecret = req.headers['x-wa-secret'] || req.query.secret;
   if (WA_SECRET && reqSecret !== WA_SECRET) {
@@ -154,7 +196,7 @@ app.post('/api/send-message', async (req, res) => {
   }
 
   if (!isReady || !sock) {
-    return res.status(503).json({ error: 'WhatsApp is not connected yet' });
+    return res.status(503).json({ error: 'WhatsApp is not connected' });
   }
 
   const { phone, message } = req.body;
@@ -175,7 +217,7 @@ app.post('/api/send-message', async (req, res) => {
   }
 });
 
-// ─── Baileys Connection ───────────────────────────────────────────────────────
+// ─── Baileys Connection Setup ─────────────────────────────────────────────────
 async function startBaileys() {
   if (isConnecting) return;
   isConnecting = true;
@@ -215,7 +257,6 @@ async function startBaileys() {
         qrCodeData = null;
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-        console.log(`[Baileys] Disconnected (${statusCode}). Reconnecting: ${shouldReconnect}`);
 
         if (shouldReconnect) {
           setTimeout(() => {
@@ -238,34 +279,6 @@ async function startBaileys() {
       }
     });
 
-    // Message receiver (optional Next.js forwarder)
-    sock.ev.on('messages.upsert', async ({ messages }) => {
-      const msg = messages[0];
-      if (!msg.message || msg.key.fromMe) return;
-
-      const senderJid = msg.key.remoteJid;
-      const senderPhone = senderJid.split('@')[0];
-      const text = msg.message.conversation || msg.message.extendedTextMessage?.text || '';
-
-      const backendUrl = process.env.BACKEND_URL;
-      if (backendUrl) {
-        try {
-          await fetch(backendUrl, {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'x-wa-secret': WA_SECRET
-            },
-            body: JSON.stringify({
-              from: senderPhone,
-              cnumber: senderPhone,
-              body: text
-            })
-          });
-        } catch (err) {}
-      }
-    });
-
   } catch (err) {
     console.error('Socket error:', err.message);
   } finally {
@@ -273,16 +286,15 @@ async function startBaileys() {
   }
 }
 
-// Keep-Alive Ping
+// ─── Self Keep-Alive Ping (For Render Inactivity Prevention) ──────────────────
 setInterval(() => {
   const publicUrl = process.env.PUBLIC_URL;
   if (publicUrl) {
-    const mod = publicUrl.startsWith('https') ? https : http;
-    mod.get(`${publicUrl}/status`, () => {}).on('error', () => {});
+    https.get(`${publicUrl}/status`, () => {}).on('error', () => {});
   }
 }, 10 * 60 * 1000);
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Server actively running on port ${PORT}`);
+  console.log(`Server running on port ${PORT}`);
   startBaileys();
 });
