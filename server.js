@@ -1,4 +1,3 @@
-// Polyfill webcrypto for Node.js environments (fixes "crypto is not defined" error)
 const nodeCrypto = require('crypto');
 if (!global.crypto) {
   global.crypto = nodeCrypto.webcrypto || nodeCrypto;
@@ -36,133 +35,131 @@ if (!fs.existsSync(SESSION_DIR)) {
 let sock = null;
 let qrCodeData = null;
 let isReady = false;
-let latestPairingCode = null;
 let isConnecting = false;
 
-// Basic Homepage Route (Direct Website Link Check)
+// Homepage redirect to Scan Page
 app.get('/', (req, res) => {
-  res.redirect('/pair');
+  res.redirect('/scan');
 });
 
-// Status Route
+// JSON Status Endpoint
 app.get('/status', (req, res) => {
   res.json({
     ready: isReady,
     qr: qrCodeData,
-    pairingCode: latestPairingCode,
     waSecret: WA_SECRET
   });
 });
 
-// UI Route for Pairing
-app.get('/pair', (req, res) => {
+// Live QR Code Scan UI
+app.get('/scan', (req, res) => {
   res.send(`
     <!DOCTYPE html>
     <html lang="en">
     <head>
       <meta charset="UTF-8">
       <meta name="viewport" content="width=device-width, initial-scale=1.0">
-      <title>WhatsApp Phone Pairing</title>
+      <title>WhatsApp QR Connect</title>
       <style>
-        body { font-family: system-ui, -apple-system, sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; background: #f0f2f5; }
-        .card { background: white; padding: 28px; border-radius: 12px; box-shadow: 0 4px 14px rgba(0,0,0,0.1); width: 100%; max-width: 380px; text-align: center; }
-        h2 { margin-top: 0; color: #111b21; }
-        input { width: 100%; padding: 12px; margin: 12px 0; border: 1px solid #ccc; border-radius: 8px; font-size: 16px; box-sizing: border-box; text-align: center; }
-        button { width: 100%; padding: 12px; background: #25d366; border: none; color: white; font-size: 16px; font-weight: bold; border-radius: 8px; cursor: pointer; }
-        button:hover { background: #20ba59; }
-        #codeBox { display: none; margin-top: 20px; padding: 14px; background: #e7fce8; border: 2px dashed #25d366; border-radius: 8px; font-size: 26px; font-weight: bold; letter-spacing: 4px; color: #075e54; }
-        .instructions { font-size: 13px; color: #667781; margin-top: 14px; line-height: 1.5; text-align: left; }
+        body { font-family: system-ui, -apple-system, sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; background: #0b141a; color: #e9edef; }
+        .card { background: #111b21; padding: 32px; border-radius: 16px; box-shadow: 0 8px 24px rgba(0,0,0,0.5); width: 100%; max-width: 380px; text-align: center; border: 1px solid #222d34; }
+        h2 { margin-top: 0; font-size: 22px; color: #00a884; }
+        .qr-box { background: white; padding: 16px; border-radius: 12px; display: inline-block; margin: 16px 0; min-width: 250px; min-height: 250px; }
+        img { width: 250px; height: 250px; display: block; }
+        .status-badge { display: inline-block; padding: 6px 14px; border-radius: 20px; font-size: 13px; font-weight: 600; margin-bottom: 12px; }
+        .badge-loading { background: #3b4a54; color: #aebac1; }
+        .badge-ready { background: #00a884; color: #111b21; }
+        .instructions { font-size: 14px; color: #8696a0; line-height: 1.6; text-align: left; margin-top: 14px; background: #1f2c34; padding: 14px; border-radius: 8px; }
+        .instructions b { color: #e9edef; }
+        button { background: #00a884; color: #111b21; border: none; padding: 10px 18px; border-radius: 8px; font-weight: 700; cursor: pointer; margin-top: 12px; }
+        button:hover { background: #06cf9c; }
       </style>
     </head>
     <body>
       <div class="card">
-        <h2>Link WhatsApp</h2>
-        <input type="text" id="phone" placeholder="Enter 10-digit number" value="9301530783" />
-        <button onclick="getCode()">Get Pairing Code</button>
-        <div id="codeBox"></div>
-        <div class="instructions">
-          1. Mobile WhatsApp kholein ➔ <b>Linked Devices</b><br>
-          2. <b>Link a device</b> dabayein<br>
-          3. Niche <b>Link with phone number instead</b> select karein<br>
-          4. Yeh 8-character code type karein
+        <h2>WhatsApp Link</h2>
+        <div id="badge" class="status-badge badge-loading">Loading QR...</div>
+        
+        <div class="qr-box" id="qrContainer">
+          <p style="color:#667781; padding-top: 100px;">Generating QR Code...</p>
         </div>
-      </div>
-      <script>
-        async function getCode() {
-          const phone = document.getElementById('phone').value.trim();
-          if(!phone) return alert('Phone number zaroori hai');
-          const btn = document.querySelector('button');
-          btn.innerText = 'Requesting code...';
-          btn.disabled = true;
 
+        <div class="instructions">
+          1. Mobile phone me <b>WhatsApp</b> kholein<br>
+          2. Menu (3 dots ya Settings) ➔ <b>Linked Devices</b><br>
+          3. <b>Link a device</b> par tap karein<br>
+          4. Is QR code ko apne camera se <b>Scan karein</b>
+        </div>
+
+        <button onclick="resetSession()">Reset & New QR</button>
+      </div>
+
+      <script>
+        async function checkStatus() {
           try {
-            const res = await fetch('/api/pair-phone', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ phone })
-            });
+            const res = await fetch('/status');
             const data = await res.json();
-            if(data.code) {
-              const box = document.getElementById('codeBox');
-              box.innerText = data.code;
-              box.style.display = 'block';
-              btn.innerText = 'Code Received!';
-            } else {
-              alert(data.error || 'Code generate nahi ho paya');
-              btn.innerText = 'Get Pairing Code';
-              btn.disabled = false;
+            const badge = document.getElementById('badge');
+            const container = document.getElementById('qrContainer');
+
+            if (data.ready) {
+              badge.className = 'status-badge badge-ready';
+              badge.innerText = 'Connected & Active';
+              container.innerHTML = '<div style="color:#00a884; font-weight:bold; padding-top:100px; font-size:18px;">✅ WhatsApp Connected!</div>';
+            } else if (data.qr) {
+              badge.className = 'status-badge badge-loading';
+              badge.innerText = 'Scan QR Code Now';
+              container.innerHTML = '<img src="' + data.qr + '" alt="Scan QR" />';
             }
-          } catch(e) {
-            alert('Request error: ' + e.message);
-            btn.innerText = 'Get Pairing Code';
-            btn.disabled = false;
+          } catch(e) {}
+        }
+
+        async function resetSession() {
+          if (confirm('Kya aap naya QR generate karna chahte hain?')) {
+            await fetch('/api/reset-session', { method: 'POST' });
+            location.reload();
           }
         }
+
+        setInterval(checkStatus, 2500);
+        checkStatus();
       </script>
     </body>
     </html>
   `);
 });
 
-// Pairing Code Generator API
-app.post('/api/pair-phone', async (req, res) => {
+// Reset Session Endpoint
+app.post('/api/reset-session', async (req, res) => {
   try {
-    const { phone } = req.body;
-    if (!phone) return res.status(400).json({ error: 'Phone number zaroori hai' });
-
-    let cleaned = phone.toString().replace(/\D/g, '');
-    if (cleaned.length === 10) cleaned = '91' + cleaned;
-
-    if (!sock || !sock.requestPairingCode) {
-      await startBaileys();
-      await new Promise(r => setTimeout(r, 2000));
+    isReady = false;
+    qrCodeData = null;
+    if (sock) {
+      try { sock.end(); } catch (e) {}
     }
-
-    console.log(`[Baileys] Requesting pairing code for ${cleaned}...`);
-    const code = await sock.requestPairingCode(cleaned);
-    latestPairingCode = code;
-
-    return res.json({ success: true, code });
+    fs.rmSync(SESSION_DIR, { recursive: true, force: true });
+    fs.mkdirSync(SESSION_DIR, { recursive: true });
+    setTimeout(startBaileys, 1000);
+    res.json({ success: true, message: 'Session reset complete' });
   } catch (err) {
-    console.error('Pairing Code Error:', err.message);
-    return res.status(500).json({ error: err.message });
+    res.status(500).json({ error: err.message });
   }
 });
 
-// Send Message Endpoint
+// Send Message Endpoint (Next.js backend compatibility)
 app.post('/api/send-message', async (req, res) => {
   const reqSecret = req.headers['x-wa-secret'] || req.query.secret;
   if (WA_SECRET && reqSecret !== WA_SECRET) {
-    return res.status(401).json({ error: 'Unauthorized: Galat x-wa-secret header' });
+    return res.status(401).json({ error: 'Unauthorized: Invalid secret' });
   }
 
   if (!isReady || !sock) {
-    return res.status(503).json({ error: 'WhatsApp abhi connect nahi hai' });
+    return res.status(503).json({ error: 'WhatsApp is not connected yet' });
   }
 
   const { phone, message } = req.body;
   if (!phone || !message) {
-    return res.status(400).json({ error: 'phone aur message dono required hain' });
+    return res.status(400).json({ error: 'phone and message are required' });
   }
 
   try {
@@ -178,7 +175,7 @@ app.post('/api/send-message', async (req, res) => {
   }
 });
 
-// ─── Initialize Baileys Connection ───────────────────────────────────────────
+// ─── Baileys Connection ───────────────────────────────────────────────────────
 async function startBaileys() {
   if (isConnecting) return;
   isConnecting = true;
@@ -189,19 +186,16 @@ async function startBaileys() {
     try {
       const vData = await fetchLatestBaileysVersion();
       version = vData.version;
-    } catch (e) {
-      console.log('[Baileys] Version fetch fallback used');
-    }
+    } catch (e) {}
 
     sock = makeWASocket({
       version,
       auth: state,
       logger: pino({ level: 'silent' }),
       printQRInTerminal: false,
-      browser: ['Chrome (Linux)', '', ''],
+      browser: ['Mac OS', 'Chrome', '122.0.0.0'],
       syncFullHistory: false,
-      connectTimeoutMs: 60000,
-      defaultQueryTimeoutMs: 60000
+      connectTimeoutMs: 60000
     });
 
     sock.ev.on('creds.update', saveCreds);
@@ -210,7 +204,7 @@ async function startBaileys() {
       const { connection, lastDisconnect, qr } = update;
 
       if (qr) {
-        qrcode.toDataURL(qr).then(url => {
+        qrcode.toDataURL(qr).then((url) => {
           qrCodeData = url;
         }).catch(() => {});
         isReady = false;
@@ -221,13 +215,13 @@ async function startBaileys() {
         qrCodeData = null;
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-        console.log(`[Baileys] Disconnected (code: ${statusCode}). Reconnect: ${shouldReconnect}`);
+        console.log(`[Baileys] Disconnected (${statusCode}). Reconnecting: ${shouldReconnect}`);
 
         if (shouldReconnect) {
           setTimeout(() => {
             isConnecting = false;
             startBaileys();
-          }, 5000);
+          }, 4000);
         } else {
           try {
             fs.rmSync(SESSION_DIR, { recursive: true, force: true });
@@ -235,16 +229,16 @@ async function startBaileys() {
           setTimeout(() => {
             isConnecting = false;
             startBaileys();
-          }, 3000);
+          }, 2000);
         }
       } else if (connection === 'open') {
-        console.log('[Baileys] Connected & Ready!');
+        console.log('[Baileys] WhatsApp Connected & Active!');
         isReady = true;
         qrCodeData = null;
-        latestPairingCode = null;
       }
     });
 
+    // Message receiver (optional Next.js forwarder)
     sock.ev.on('messages.upsert', async ({ messages }) => {
       const msg = messages[0];
       if (!msg.message || msg.key.fromMe) return;
@@ -273,14 +267,22 @@ async function startBaileys() {
     });
 
   } catch (err) {
-    console.error('[Baileys] Socket init error:', err.message);
+    console.error('Socket error:', err.message);
   } finally {
     isConnecting = false;
   }
 }
 
-// ─── Start Web Server ────────────────────────────────────────────────────────
+// Keep-Alive Ping
+setInterval(() => {
+  const publicUrl = process.env.PUBLIC_URL;
+  if (publicUrl) {
+    const mod = publicUrl.startsWith('https') ? https : http;
+    mod.get(`${publicUrl}/status`, () => {}).on('error', () => {});
+  }
+}, 10 * 60 * 1000);
+
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Server actively listening on 0.0.0.0:${PORT}`);
+  console.log(`Server actively running on port ${PORT}`);
   startBaileys();
 });
