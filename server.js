@@ -10,7 +10,6 @@ const cors = require('cors');
 const qrcode = require('qrcode');
 const fs = require('fs');
 const https = require('https');
-const http = require('http');
 const pino = require('pino');
 
 const {
@@ -22,7 +21,10 @@ const {
 
 const app = express();
 app.use(cors({ origin: '*' }));
-app.use(express.json());
+
+// High resolution images aur PDF documents ke liye 50MB payload limit
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 const PORT = process.env.PORT || 10000;
 const WA_SECRET = process.env.WA_SECRET || '89599301';
@@ -39,7 +41,7 @@ let qrCodeData = null;
 let isReady = false;
 let isConnecting = false;
 
-// ─── Basic Auth Middleware (Browser Login Popup Lock) ─────────────────────────
+// Basic Auth Middleware (Scan Dashboard Protection)
 function requireAuth(req, res, next) {
   const authHeader = req.headers.authorization;
 
@@ -60,7 +62,6 @@ function requireAuth(req, res, next) {
   return res.status(401).send('Invalid username or password');
 }
 
-// ─── Public Routes ────────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
   res.redirect('/scan');
 });
@@ -73,7 +74,6 @@ app.get('/status', (req, res) => {
   });
 });
 
-// ─── Protected Routes (Scan & Test Panel with Lock) ────────────────────────────
 app.get('/scan', requireAuth, (req, res) => {
   res.send(`
     <!DOCTYPE html>
@@ -166,7 +166,7 @@ app.get('/scan', requireAuth, (req, res) => {
             const data = await res.json();
             if (data.success) {
               resBox.style.color = '#00a884';
-              resBox.innerText = '✅ Message Successfully Delivered!';
+              resBox.innerText = '✅ Message Delivered!';
             } else {
               resBox.style.color = '#ff3b30';
               resBox.innerText = 'Error: ' + (data.error || 'Failed');
@@ -188,7 +188,7 @@ app.get('/scan', requireAuth, (req, res) => {
   `);
 });
 
-// ─── Send Message API (Protected by Secret Key) ───────────────────────────────
+// ─── MULTI-FORMAT DISPATCH (PDF DOCUMENT, IMAGE, TEXT) ────────────────────────
 app.post('/api/send-message', async (req, res) => {
   const reqSecret = req.headers['x-wa-secret'] || req.query.secret;
   if (WA_SECRET && reqSecret !== WA_SECRET) {
@@ -199,9 +199,9 @@ app.post('/api/send-message', async (req, res) => {
     return res.status(503).json({ error: 'WhatsApp is not connected' });
   }
 
-  const { phone, message } = req.body;
-  if (!phone || !message) {
-    return res.status(400).json({ error: 'phone and message are required' });
+  const { phone, message, fileBase64, fileType, fileName } = req.body;
+  if (!phone) {
+    return res.status(400).json({ error: 'phone is required' });
   }
 
   try {
@@ -209,7 +209,30 @@ app.post('/api/send-message', async (req, res) => {
     if (cleaned.length === 10) cleaned = '91' + cleaned;
     const jid = `${cleaned}@s.whatsapp.net`;
 
-    await sock.sendMessage(jid, { text: message });
+    if (fileBase64) {
+      const base64Data = fileBase64.replace(/^data:([A-Za-z-+/0-9]+);base64,/, '');
+      const buffer = Buffer.from(base64Data, 'base64');
+
+      if (fileType === 'image') {
+        // WhatsApp Image format
+        await sock.sendMessage(jid, {
+          image: buffer,
+          caption: message || ''
+        });
+      } else {
+        // WhatsApp Document format (PDF)
+        await sock.sendMessage(jid, {
+          document: buffer,
+          mimetype: 'application/pdf',
+          fileName: fileName || 'Fee_Receipt.pdf',
+          caption: message || ''
+        });
+      }
+    } else {
+      // Standard Text message
+      await sock.sendMessage(jid, { text: message });
+    }
+
     return res.json({ success: true });
   } catch (err) {
     console.error('Send Error:', err.message);
@@ -217,7 +240,6 @@ app.post('/api/send-message', async (req, res) => {
   }
 });
 
-// ─── Baileys Connection Setup ─────────────────────────────────────────────────
 async function startBaileys() {
   if (isConnecting) return;
   isConnecting = true;
@@ -286,7 +308,6 @@ async function startBaileys() {
   }
 }
 
-// ─── Self Keep-Alive Ping (For Render Inactivity Prevention) ──────────────────
 setInterval(() => {
   const publicUrl = process.env.PUBLIC_URL;
   if (publicUrl) {
