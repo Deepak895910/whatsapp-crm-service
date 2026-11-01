@@ -5,10 +5,11 @@ if (!globalThis.crypto) {
 
 import express from "express";
 import baileysPkg from "@whiskeysockets/baileys";
+import qrcode from "qrcode";
 import fs from "fs";
 
 const makeWASocket = baileysPkg.default || baileysPkg;
-const { DisconnectReason, useMultiFileAuthState } = baileysPkg;
+const { DisconnectReason, useMultiFileAuthState, fetchLatestBaileysVersion } = baileysPkg;
 
 const app = express();
 app.use(express.json());
@@ -20,15 +21,18 @@ if (!fs.existsSync(SESSION_DIR)) {
 
 let sock = null;
 let isConnected = false;
+let currentQR = null;
 
 async function startWhatsApp() {
   try {
     const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
+    const { version } = await fetchLatestBaileysVersion();
 
     sock = makeWASocket({
+      version,
       auth: state,
       printQRInTerminal: false,
-      browser: ["Library CRM", "Chrome", "1.0.0"],
+      browser: ["Library CRM", "Chrome", "120.0.0"],
       syncFullHistory: false,
       shouldIgnoreJid: (jid) => jid.endsWith("@broadcast"),
       defaultQueryTimeoutMs: 60000,
@@ -37,20 +41,24 @@ async function startWhatsApp() {
 
     sock.ev.on("creds.update", saveCreds);
 
-    sock.ev.on("connection.update", (update) => {
-      const { connection, lastDisconnect } = update;
+    sock.ev.on("connection.update", async (update) => {
+      const { connection, lastDisconnect, qr } = update;
+
+      if (qr) {
+        currentQR = qr;
+        console.log("New QR Generated");
+      }
 
       if (connection === "close") {
         isConnected = false;
         const statusCode = lastDisconnect?.error?.output?.statusCode;
-        const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-        console.log(`Connection closed: ${statusCode}. Reconnecting: ${shouldReconnect}`);
-        
-        if (shouldReconnect) {
-          setTimeout(startWhatsApp, 5000);
+        console.log(`Connection closed: ${statusCode}`);
+        if (statusCode !== DisconnectReason.loggedOut) {
+          setTimeout(startWhatsApp, 3000);
         }
       } else if (connection === "open") {
         isConnected = true;
+        currentQR = null;
         console.log(">>> WhatsApp CRM Service is connected and ready! <<<");
       }
     });
@@ -61,6 +69,28 @@ async function startWhatsApp() {
 }
 
 startWhatsApp();
+
+// Browser QR code viewer
+app.get("/qr", async (req, res) => {
+  if (isConnected) {
+    return res.send("<h2>WhatsApp is already connected!</h2>");
+  }
+  if (!currentQR) {
+    return res.send("<h2>QR Code is generating... please refresh in 5 seconds.</h2>");
+  }
+  try {
+    const qrImage = await qrcode.toDataURL(currentQR);
+    res.send(`
+      <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:90vh;font-family:sans-serif;">
+        <h2>Scan this QR Code from WhatsApp</h2>
+        <img src="${qrImage}" style="width:300px;height:300px;border:1px solid #ccc;padding:10px;border-radius:8px;" />
+        <p>WhatsApp Settings -> Linked Devices -> Link a Device</p>
+      </div>
+    `);
+  } catch (err) {
+    res.status(500).send("Error rendering QR");
+  }
+});
 
 app.post("/send-message", async (req, res) => {
   try {
