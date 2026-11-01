@@ -1,54 +1,58 @@
 ﻿import express from "express";
-import makeWASocket, { DisconnectReason, useMultiFileAuthState, fetchLatestBaileysVersion } from "@whiskeysockets/baileys";
-import qrcode from "qrcode-terminal";
+import makeWASocket, { DisconnectReason, useMultiFileAuthState } from "@whiskeysockets/baileys";
+import fs from "fs";
 
 const app = express();
 app.use(express.json());
 
-let sock = null;
-
-async function startWhatsApp() {
-  const { state, saveCreds } = await useMultiFileAuthState("auth_session");
-  const { version } = await fetchLatestBaileysVersion();
-
-  sock = makeWASocket({
-    version,
-    auth: state,
-    printQRInTerminal: false,
-    browser: ["Ubuntu", "Chrome", "20.0.04"],
-    syncFullHistory: false,
-    markOnlineOnConnect: false
-  });
-
-  sock.ev.on("creds.update", saveCreds);
-
-  sock.ev.on("connection.update", async (update) => {
-    const { connection, lastDisconnect, qr } = update;
-
-    if (qr) {
-      console.log("\n=================================");
-      console.log("SCAN THIS QR CODE NOW (VALID FOR 60s):");
-      console.log("=================================\n");
-      qrcode.generate(qr, { small: true });
-    }
-
-    if (connection === "close") {
-      const statusCode = lastDisconnect?.error?.output?.statusCode;
-      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-      
-      console.log(`Connection closed: ${statusCode}. Reconnecting: ${shouldReconnect}`);
-      
-      if (shouldReconnect) {
-        setTimeout(startWhatsApp, 3000);
-      } else {
-        console.log("Logged out from phone. Delete auth_session folder and restart.");
-      }
-    } else if (connection === "open") {
-      console.log("\n>>> SUCCESS! WHATSAPP CONNECTED PERMANENTLY! <<<\n");
-    }
-  });
+const SESSION_DIR = "./auth_session";
+if (!fs.existsSync(SESSION_DIR)) {
+  fs.mkdirSync(SESSION_DIR, { recursive: true });
 }
 
+let sock = null;
+let isConnected = false;
+
+async function startWhatsApp() {
+  try {
+    const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
+
+    sock = makeWASocket({
+      auth: state,
+      printQRInTerminal: false,
+      browser: ["Library CRM", "Chrome", "1.0.0"],
+      syncFullHistory: false,
+      shouldIgnoreJid: (jid) => jid.endsWith("@broadcast"),
+      defaultQueryTimeoutMs: 60000,
+      connectTimeoutMs: 60000,
+    });
+
+    sock.ev.on("creds.update", saveCreds);
+
+    sock.ev.on("connection.update", (update) => {
+      const { connection, lastDisconnect } = update;
+
+      if (connection === "close") {
+        isConnected = false;
+        const statusCode = lastDisconnect?.error?.output?.statusCode;
+        const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+        console.log(`Connection closed with status: ${statusCode}. Reconnecting: ${shouldReconnect}`);
+        
+        if (shouldReconnect) {
+          setTimeout(startWhatsApp, 5000);
+        }
+      } else if (connection === "open") {
+        isConnected = true;
+        console.log("WhatsApp CRM Service is connected and ready!");
+      }
+    });
+  } catch (err) {
+    console.error("WhatsApp Init Error:", err.message);
+    setTimeout(startWhatsApp, 5000);
+  }
+}
+
+// Start WhatsApp in background
 startWhatsApp();
 
 app.post("/send-message", async (req, res) => {
@@ -58,8 +62,8 @@ app.post("/send-message", async (req, res) => {
       return res.status(400).json({ error: "number and message are required" });
     }
 
-    if (!sock) {
-      return res.status(503).json({ error: "WhatsApp socket not initialized" });
+    if (!sock || !isConnected) {
+      return res.status(503).json({ error: "WhatsApp is not connected yet" });
     }
 
     const cleanNumber = number.replace(/[^0-9]/g, "");
@@ -74,10 +78,14 @@ app.post("/send-message", async (req, res) => {
 });
 
 app.get("/", (req, res) => {
-  res.send("WhatsApp Service Active");
+  res.json({
+    status: "online",
+    whatsappConnected: isConnected,
+    timestamp: new Date().toISOString()
+  });
 });
 
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => {
+app.listen(PORT, "0.0.0.0", () => {
   console.log(`Server listening on port ${PORT}`);
 });
