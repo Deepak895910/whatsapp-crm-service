@@ -1,4 +1,9 @@
-﻿import express from "express";
+﻿import crypto from "crypto";
+if (!globalThis.crypto) {
+  globalThis.crypto = crypto;
+}
+
+import express from "express";
 import baileysPkg from "@whiskeysockets/baileys";
 import fs from "fs";
 
