@@ -12,7 +12,19 @@ const makeWASocket = baileysPkg.default || baileysPkg;
 const { DisconnectReason, useMultiFileAuthState, fetchLatestBaileysVersion } = baileysPkg;
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "50mb" }));
+app.use(express.urlencoded({ limit: "50mb", extended: true }));
+
+// Enable CORS for Next.js frontend calls
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(200);
+  }
+  next();
+});
 
 const SESSION_DIR = "./auth_session";
 if (!fs.existsSync(SESSION_DIR)) {
@@ -70,7 +82,7 @@ async function startWhatsApp() {
 
 startWhatsApp();
 
-// Browser QR code viewer
+// Browser QR viewer
 app.get("/qr", async (req, res) => {
   if (isConnected) {
     return res.send("<h2>WhatsApp is already connected!</h2>");
@@ -92,27 +104,45 @@ app.get("/qr", async (req, res) => {
   }
 });
 
-app.post("/send-message", async (req, res) => {
+// Universal handler for both /send-message and /api/send-message (with PDF Base64 support)
+const handleSendMessage = async (req, res) => {
   try {
-    const { number, message } = req.body;
-    if (!number || !message) {
-      return res.status(400).json({ error: "number and message are required" });
+    const rawNumber = req.body.phone || req.body.number;
+    const { message, fileBase64, fileName } = req.body;
+
+    if (!rawNumber || (!message && !fileBase64)) {
+      return res.status(400).json({ error: "phone/number and message/file are required" });
     }
 
     if (!sock || !isConnected) {
       return res.status(503).json({ error: "WhatsApp is not connected yet" });
     }
 
-    const cleanNumber = number.replace(/[^0-9]/g, "");
-    const jid = `${cleanNumber}@s.whatsapp.net`;
+    const cleanNumber = String(rawNumber).replace(/[^0-9]/g, "");
+    const fullNumber = cleanNumber.startsWith("91") ? cleanNumber : `91${cleanNumber}`;
+    const jid = `${fullNumber}@s.whatsapp.net`;
 
-    await sock.sendMessage(jid, { text: message });
+    if (fileBase64) {
+      const buffer = Buffer.from(fileBase64, "base64");
+      await sock.sendMessage(jid, {
+        document: buffer,
+        mimetype: "application/pdf",
+        fileName: fileName || "Fee_Receipt.pdf",
+        caption: message || ""
+      });
+    } else {
+      await sock.sendMessage(jid, { text: message });
+    }
+
     return res.json({ success: true, message: "Sent successfully" });
   } catch (error) {
     console.error("Failed to send message:", error);
     return res.status(500).json({ error: error.message });
   }
-});
+};
+
+app.post("/send-message", handleSendMessage);
+app.post("/api/send-message", handleSendMessage);
 
 app.get("/", (req, res) => {
   res.json({
