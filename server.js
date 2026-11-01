@@ -1,6 +1,9 @@
 ﻿import express from "express";
-import makeWASocket, { DisconnectReason, useMultiFileAuthState } from "@whiskeysockets/baileys";
+import baileysPkg from "@whiskeysockets/baileys";
 import fs from "fs";
+
+const makeWASocket = baileysPkg.default || baileysPkg;
+const { DisconnectReason, useMultiFileAuthState } = baileysPkg;
 
 const app = express();
 app.use(express.json());
@@ -36,14 +39,14 @@ async function startWhatsApp() {
         isConnected = false;
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-        console.log(`Connection closed with status: ${statusCode}. Reconnecting: ${shouldReconnect}`);
+        console.log(`Connection closed: ${statusCode}. Reconnecting: ${shouldReconnect}`);
         
         if (shouldReconnect) {
           setTimeout(startWhatsApp, 5000);
         }
       } else if (connection === "open") {
         isConnected = true;
-        console.log("WhatsApp CRM Service is connected and ready!");
+        console.log(">>> WhatsApp CRM Service is connected and ready! <<<");
       }
     });
   } catch (err) {
@@ -52,7 +55,6 @@ async function startWhatsApp() {
   }
 }
 
-// Start WhatsApp in background
 startWhatsApp();
 
 app.post("/send-message", async (req, res) => {
@@ -85,7 +87,7 @@ app.get("/", (req, res) => {
   });
 });
 
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT || 10000;
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Server listening on port ${PORT}`);
 });
