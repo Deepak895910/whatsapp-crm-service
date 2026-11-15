@@ -4,17 +4,14 @@ if (!globalThis.crypto) {
 }
 
 import express from "express";
-import baileysPkg from "@whiskeysockets/baileys";
-import qrcode from "qrcode";
-import fs from "fs";
-
-const makeWASocket = baileysPkg.default || baileysPkg;
-const {
+import makeWASocket, {
   DisconnectReason,
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore,
-} = baileysPkg;
+} from "@whiskeysockets/baileys";
+import qrcode from "qrcode";
+import fs from "fs";
 
 const app = express();
 app.use(express.json({ limit: "50mb" }));
@@ -60,7 +57,9 @@ async function startWhatsApp() {
     const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
     const { version } = await fetchLatestBaileysVersion();
 
-    sock = makeWASocket({
+    const createSocket = typeof makeWASocket === "function" ? makeWASocket : makeWASocket.default;
+
+    sock = createSocket({
       version,
       logger: silentLogger,
       auth: {
@@ -75,7 +74,6 @@ async function startWhatsApp() {
       shouldIgnoreJid: (jid) => jid.endsWith("@broadcast"),
       defaultQueryTimeoutMs: 60000,
       connectTimeoutMs: 60000,
-      // Resolves "Waiting for this message" when recipient requests decryption retry
       getMessage: async (key) => {
         if (key?.id && sentMessagesStore.has(key.id)) {
           return sentMessagesStore.get(key.id);
@@ -122,15 +120,12 @@ async function dispatchWithSync(jid, content) {
     await sock.sendPresenceUpdate("composing", jid);
     await new Promise((r) => setTimeout(r, 600));
     await sock.sendPresenceUpdate("paused", jid);
-  } catch (_) {
-    // Ignore if recipient's privacy settings block presence
-  }
+  } catch (_) {}
 
   const sentMsg = await sock.sendMessage(jid, content);
 
   if (sentMsg?.key?.id && sentMsg?.message) {
     sentMessagesStore.set(sentMsg.key.id, sentMsg.message);
-    // Keep in cache for 3 hours to handle delayed retries
     setTimeout(() => sentMessagesStore.delete(sentMsg.key.id), 3 * 60 * 60 * 1000);
   }
 
@@ -177,7 +172,6 @@ const handleSendMessage = async (req, res) => {
     const fullNumber = cleanNumber.length === 10 ? `91${cleanNumber}` : cleanNumber;
     const rawJid = `${fullNumber}@s.whatsapp.net`;
 
-    // Verify number on WhatsApp & fetch canonical JID
     const [waResult] = await sock.onWhatsApp(rawJid);
     if (!waResult || !waResult.exists) {
       return res.status(400).json({ error: "Number is not registered on WhatsApp" });
