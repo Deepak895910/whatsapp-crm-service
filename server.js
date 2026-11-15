@@ -4,14 +4,12 @@ if (!globalThis.crypto) {
 }
 
 import express from "express";
-import makeWASocket, {
-  DisconnectReason,
-  useMultiFileAuthState,
-  fetchLatestBaileysVersion,
-  makeCacheableSignalKeyStore,
-} from "@whiskeysockets/baileys";
+import baileysPkg from "@whiskeysockets/baileys";
 import qrcode from "qrcode";
 import fs from "fs";
+
+const makeWASocket = baileysPkg.default || baileysPkg;
+const { DisconnectReason, useMultiFileAuthState, fetchLatestBaileysVersion } = baileysPkg;
 
 const app = express();
 app.use(express.json({ limit: "50mb" }));
@@ -37,49 +35,20 @@ let sock = null;
 let isConnected = false;
 let currentQR = null;
 
-// Store sent messages in memory so WhatsApp retry requests ("Waiting for this message") resolve immediately
-const sentMessagesStore = new Map();
-const msgRetryCounterCache = new Map();
-
-const silentLogger = {
-  level: "silent",
-  trace: () => {},
-  debug: () => {},
-  info: () => {},
-  warn: () => {},
-  error: () => {},
-  fatal: () => {},
-  child: () => silentLogger,
-};
-
 async function startWhatsApp() {
   try {
     const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
     const { version } = await fetchLatestBaileysVersion();
 
-    const createSocket = typeof makeWASocket === "function" ? makeWASocket : makeWASocket.default;
-
-    sock = createSocket({
+    sock = makeWASocket({
       version,
-      logger: silentLogger,
-      auth: {
-        creds: state.creds,
-        keys: makeCacheableSignalKeyStore(state.keys, silentLogger),
-      },
+      auth: state,
       printQRInTerminal: false,
       browser: ["Library CRM", "Chrome", "120.0.0"],
-      msgRetryCounterCache,
       syncFullHistory: false,
-      markOnlineOnConnect: true,
       shouldIgnoreJid: (jid) => jid.endsWith("@broadcast"),
       defaultQueryTimeoutMs: 60000,
       connectTimeoutMs: 60000,
-      getMessage: async (key) => {
-        if (key?.id && sentMessagesStore.has(key.id)) {
-          return sentMessagesStore.get(key.id);
-        }
-        return { conversation: "" };
-      },
     });
 
     sock.ev.on("creds.update", saveCreds);
@@ -112,25 +81,6 @@ async function startWhatsApp() {
 }
 
 startWhatsApp();
-
-// Helper: Sync Signal encryption session before sending & cache message for retries
-async function dispatchWithSync(jid, content) {
-  try {
-    await sock.presenceSubscribe(jid);
-    await sock.sendPresenceUpdate("composing", jid);
-    await new Promise((r) => setTimeout(r, 600));
-    await sock.sendPresenceUpdate("paused", jid);
-  } catch (_) {}
-
-  const sentMsg = await sock.sendMessage(jid, content);
-
-  if (sentMsg?.key?.id && sentMsg?.message) {
-    sentMessagesStore.set(sentMsg.key.id, sentMsg.message);
-    setTimeout(() => sentMessagesStore.delete(sentMsg.key.id), 3 * 60 * 60 * 1000);
-  }
-
-  return sentMsg;
-}
 
 // Browser QR viewer
 app.get("/qr", async (req, res) => {
@@ -168,30 +118,23 @@ const handleSendMessage = async (req, res) => {
       return res.status(503).json({ error: "WhatsApp is not connected yet" });
     }
 
-    const cleanNumber = String(rawNumber).replace(/[^0-9]/g, "").slice(-10);
-    const fullNumber = cleanNumber.length === 10 ? `91${cleanNumber}` : cleanNumber;
-    const rawJid = `${fullNumber}@s.whatsapp.net`;
-
-    const [waResult] = await sock.onWhatsApp(rawJid);
-    if (!waResult || !waResult.exists) {
-      return res.status(400).json({ error: "Number is not registered on WhatsApp" });
-    }
-
-    const targetJid = waResult.jid;
+    const cleanNumber = String(rawNumber).replace(/[^0-9]/g, "");
+    const fullNumber = cleanNumber.startsWith("91") ? cleanNumber : `91${cleanNumber}`;
+    const jid = `${fullNumber}@s.whatsapp.net`;
 
     if (fileBase64) {
       const buffer = Buffer.from(fileBase64, "base64");
-      const sent = await dispatchWithSync(targetJid, {
+      await sock.sendMessage(jid, {
         document: buffer,
         mimetype: "application/pdf",
         fileName: fileName || "Fee_Receipt.pdf",
-        caption: message || "",
+        caption: message || ""
       });
-      return res.json({ success: true, message: "Sent successfully", messageId: sent?.key?.id });
+    } else {
+      await sock.sendMessage(jid, { text: message });
     }
 
-    const sent = await dispatchWithSync(targetJid, { text: message });
-    return res.json({ success: true, message: "Sent successfully", messageId: sent?.key?.id });
+    return res.json({ success: true, message: "Sent successfully" });
   } catch (error) {
     console.error("Failed to send message:", error);
     return res.status(500).json({ error: error.message });
@@ -205,7 +148,7 @@ app.get("/", (req, res) => {
   res.json({
     status: "online",
     whatsappConnected: isConnected,
-    timestamp: new Date().toISOString(),
+    timestamp: new Date().toISOString()
   });
 });
 
