@@ -4,18 +4,19 @@ if (!globalThis.crypto) {
 }
 
 import express from "express";
-import baileysPkg from "@whiskeysockets/baileys";
+import makeWASocket, {
+  DisconnectReason,
+  useMultiFileAuthState,
+  fetchLatestBaileysVersion,
+} from "@whiskeysockets/baileys";
 import qrcode from "qrcode";
 import fs from "fs";
-
-const makeWASocket = baileysPkg.default || baileysPkg;
-const { DisconnectReason, useMultiFileAuthState, fetchLatestBaileysVersion } = baileysPkg;
 
 const app = express();
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ limit: "50mb", extended: true }));
 
-// Enable CORS for Next.js frontend calls
+// Enable CORS for frontend/Next.js calls
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
@@ -43,7 +44,7 @@ async function startWhatsApp() {
     sock = makeWASocket({
       version,
       auth: state,
-      printQRInTerminal: false,
+      printQRInTerminal: true, // Terminal par QR code dikhane ke liye
       browser: ["Library CRM", "Chrome", "120.0.0"],
       syncFullHistory: false,
       shouldIgnoreJid: (jid) => jid.endsWith("@broadcast"),
@@ -82,7 +83,7 @@ async function startWhatsApp() {
 
 startWhatsApp();
 
-// Browser QR viewer
+// Browser QR viewer endpoint
 app.get("/qr", async (req, res) => {
   if (isConnected) {
     return res.send("<h2>WhatsApp is already connected!</h2>");
@@ -104,7 +105,7 @@ app.get("/qr", async (req, res) => {
   }
 });
 
-// Universal handler for both /send-message and /api/send-message (with PDF Base64 support)
+// Universal message sending handler
 const handleSendMessage = async (req, res) => {
   try {
     const rawNumber = req.body.phone || req.body.number;
