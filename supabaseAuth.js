@@ -1,4 +1,4 @@
-﻿import { createClient } from "@supabase/supabase-js";
+import { createClient } from "@supabase/supabase-js";
 import { initAuthCreds, BufferJSON } from "@whiskeysockets/baileys";
 
 const supabaseUrl = process.env.SUPABASE_URL || "https://spcjilhhjeudvyyfwqyt.supabase.co";
@@ -15,7 +15,7 @@ export async function useSupabaseAuthState() {
         data: JSON.parse(serialized),
       });
     } catch (err) {
-      console.error("Supabase write error:", err);
+      console.error(`Supabase write error for ${id}:`, err);
     }
   };
 
@@ -30,7 +30,7 @@ export async function useSupabaseAuthState() {
       if (error || !data || !data.data) return null;
       return JSON.parse(JSON.stringify(data.data), BufferJSON.reviver);
     } catch (err) {
-      console.error("Supabase read error:", err);
+      console.error(`Supabase read error for ${id}:`, err);
       return null;
     }
   };
@@ -39,11 +39,13 @@ export async function useSupabaseAuthState() {
     try {
       await supabase.from("whatsapp_auth").delete().eq("id", id);
     } catch (err) {
-      console.error("Supabase remove error:", err);
+      console.error(`Supabase remove error for ${id}:`, err);
     }
   };
 
-  const creds = (await readData("creds")) || initAuthCreds();
+  // 1. Load creds from Supabase or initialize new ones
+  const storedCreds = await readData("creds");
+  const creds = storedCreds ? JSON.parse(JSON.stringify(storedCreds), BufferJSON.reviver) : initAuthCreds();
 
   return {
     state: {
@@ -51,29 +53,38 @@ export async function useSupabaseAuthState() {
       keys: {
         get: async (type, ids) => {
           const result = {};
-          for (const id of ids) {
-            let value = await readData(`${type}-${id}`);
-            if (type === "app-state-sync-key" && value) {
-              value = JSON.parse(JSON.stringify(value), BufferJSON.reviver);
-            }
-            result[id] = value;
-          }
+          await Promise.all(
+            ids.map(async (id) => {
+              let value = await readData(`${type}-${id}`);
+              if (value) {
+                result[id] = JSON.parse(JSON.stringify(value), BufferJSON.reviver);
+              }
+            })
+          );
           return result;
         },
         set: async (data) => {
+          const tasks = [];
           for (const category in data) {
             for (const id in data[category]) {
-              const val = data[category][id];
-              if (val) {
-                await writeData(`${category}-${id}`, val);
+              const value = data[category][id];
+              const keyName = `${category}-${id}`;
+              if (value) {
+                const serialized = JSON.stringify(value, BufferJSON.replacer);
+                tasks.push(writeData(keyName, JSON.parse(serialized)));
               } else {
-                await removeData(`${category}-${id}`);
+                tasks.push(removeData(keyName));
               }
             }
           }
+          await Promise.all(tasks);
         },
       },
     },
-    saveCreds: () => writeData("creds", creds),
+    // 2. Ensure creds are strictly saved to Supabase whenever updated
+    saveCreds: async () => {
+      const serializedCreds = JSON.stringify(creds, BufferJSON.replacer);
+      await writeData("creds", JSON.parse(serializedCreds));
+    },
   };
 }
