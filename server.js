@@ -1,16 +1,19 @@
-﻿import crypto from "crypto";
+import crypto from "crypto";
 if (!globalThis.crypto) {
   globalThis.crypto = crypto;
 }
 
 import express from "express";
-import makeWASocket, {
-  DisconnectReason,
-  useMultiFileAuthState,
-  fetchLatestBaileysVersion,
-} from "@whiskeysockets/baileys";
+import { createRequire } from "module";
 import qrcode from "qrcode";
-import fs from "fs";
+import { useSupabaseAuthState } from "./supabaseAuth.js";
+
+const require = createRequire(import.meta.url);
+const baileys = require("@whiskeysockets/baileys");
+
+const makeWASocket = baileys.default?.makeWASocket || baileys.makeWASocket;
+const DisconnectReason = baileys.default?.DisconnectReason || baileys.DisconnectReason;
+const fetchLatestBaileysVersion = baileys.default?.fetchLatestBaileysVersion || baileys.fetchLatestBaileysVersion;
 
 const app = express();
 app.use(express.json({ limit: "50mb" }));
@@ -27,24 +30,29 @@ app.use((req, res, next) => {
   next();
 });
 
-const SESSION_DIR = "./auth_session";
-if (!fs.existsSync(SESSION_DIR)) {
-  fs.mkdirSync(SESSION_DIR, { recursive: true });
-}
-
 let sock = null;
 let isConnected = false;
 let currentQR = null;
 
 async function startWhatsApp() {
   try {
-    const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
-    const { version } = await fetchLatestBaileysVersion();
+    // Load session directly from Supabase database using id/data schema
+    const { state, saveCreds } = await useSupabaseAuthState();
+    
+    let version = [2, 3000, 1015901307];
+    try {
+      if (typeof fetchLatestBaileysVersion === "function") {
+        const latest = await fetchLatestBaileysVersion();
+        if (latest?.version) version = latest.version;
+      }
+    } catch (e) {
+      console.log("Using fallback Baileys version.");
+    }
 
     sock = makeWASocket({
       version,
       auth: state,
-      printQRInTerminal: true, // Terminal par QR code dikhane ke liye
+      printQRInTerminal: false,
       browser: ["Library CRM", "Chrome", "120.0.0"],
       syncFullHistory: false,
       shouldIgnoreJid: (jid) => jid.endsWith("@broadcast"),
@@ -59,20 +67,20 @@ async function startWhatsApp() {
 
       if (qr) {
         currentQR = qr;
-        console.log("New QR Generated");
+        console.log("New QR Generated. Open http://localhost:10000/qr to scan.");
       }
 
       if (connection === "close") {
         isConnected = false;
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         console.log(`Connection closed: ${statusCode}`);
-        if (statusCode !== DisconnectReason.loggedOut) {
+        if (statusCode !== DisconnectReason?.loggedOut) {
           setTimeout(startWhatsApp, 3000);
         }
       } else if (connection === "open") {
         isConnected = true;
         currentQR = null;
-        console.log(">>> WhatsApp CRM Service is connected and ready! <<<");
+        console.log(">>> WhatsApp CRM Service is connected and synced with Supabase! <<<");
       }
     });
   } catch (err) {
@@ -105,7 +113,7 @@ app.get("/qr", async (req, res) => {
   }
 });
 
-// Universal message sending handler
+// Universal message sending handler (Text & PDF)
 const handleSendMessage = async (req, res) => {
   try {
     const rawNumber = req.body.phone || req.body.number;
