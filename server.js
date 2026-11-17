@@ -36,7 +36,7 @@ let currentQR = null;
 
 async function startWhatsApp() {
   try {
-    // Load session directly from Supabase database using id/data schema
+    // Load session directly from Supabase database
     const { state, saveCreds } = await useSupabaseAuthState();
     
     let version = [2, 3000, 1015901307];
@@ -54,10 +54,11 @@ async function startWhatsApp() {
       auth: state,
       printQRInTerminal: false,
       browser: ["Library CRM", "Chrome", "120.0.0"],
-      syncFullHistory: false,
+      syncFullHistory: false, // Prevents heavy chat sync timeouts
       shouldIgnoreJid: (jid) => jid.endsWith("@broadcast"),
       defaultQueryTimeoutMs: 60000,
       connectTimeoutMs: 60000,
+      keepAliveIntervalMs: 25000, // Keeps websocket alive and active
     });
 
     sock.ev.on("creds.update", saveCreds);
@@ -67,17 +68,32 @@ async function startWhatsApp() {
 
       if (qr) {
         currentQR = qr;
+        isConnected = false;
         console.log("New QR Generated. Open http://localhost:10000/qr to scan.");
       }
 
       if (connection === "close") {
         isConnected = false;
         const statusCode = lastDisconnect?.error?.output?.statusCode;
-        console.log(`Connection closed: ${statusCode}`);
-        if (statusCode !== DisconnectReason?.loggedOut) {
-          setTimeout(startWhatsApp, 3000);
+        console.log(`Connection closed with status code: ${statusCode}`);
+
+        // Proper socket cleanup to prevent multiple conflicting listeners/connections
+        if (sock) {
+          try {
+            sock.ev.removeAllListeners();
+          } catch (e) {}
+          sock = null;
         }
-      } else if (connection === "open") {
+
+        // Auto-reconnect if not explicitly logged out by user
+        if (statusCode !== DisconnectReason?.loggedOut) {
+          console.log("Reconnecting automatically in 3 seconds...");
+          setTimeout(startWhatsApp, 3000);
+        } else {
+          console.log("Device explicitly logged out. Please clear database table and rescan.");
+        }
+      } 
+      else if (connection === "open") {
         isConnected = true;
         currentQR = null;
         console.log(">>> WhatsApp CRM Service is connected and synced with Supabase! <<<");
@@ -113,7 +129,7 @@ app.get("/qr", async (req, res) => {
   }
 });
 
-// Universal message sending handler (Text & PDF)
+// Universal message sending handler (Text & PDF Receipts)
 const handleSendMessage = async (req, res) => {
   try {
     const rawNumber = req.body.phone || req.body.number;
