@@ -1,51 +1,51 @@
 import { createClient } from "@supabase/supabase-js";
 import { initAuthCreds, BufferJSON } from "@whiskeysockets/baileys";
 
-const supabaseUrl = process.env.SUPABASE_URL || "https://spcjilhhjeudvyyfwqyt.supabase.co";
-const supabaseKey = process.env.SUPABASE_SERVICE_KEY || "sb_publishable_ZbZYXO2lesGT2mCEybGYbQ_OqYjeuGY";
+// Use a server-side Supabase secret. A publishable/anon key is not suitable
+// for persisting WhatsApp credentials unless explicit, secure RLS policies exist.
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_KEY;
 
-export const supabase = createClient(supabaseUrl, supabaseKey);
+if (!supabaseUrl || !supabaseKey) {
+  throw new Error(
+    "Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY (server-side secret). WhatsApp auth cannot be persisted safely."
+  );
+}
+
+const supabase = createClient(supabaseUrl, supabaseKey, {
+  auth: { persistSession: false, autoRefreshToken: false },
+});
 
 export async function useSupabaseAuthState() {
-  const writeData = async (id, data) => {
-    try {
-      const serialized = JSON.stringify(data, BufferJSON.replacer);
-      await supabase.from("whatsapp_auth").upsert({
-        id,
-        data: JSON.parse(serialized),
-      });
-    } catch (err) {
-      console.error(`Supabase write error for ${id}:`, err);
-    }
+  const writeData = async (id, value) => {
+    const serialized = JSON.stringify(value, BufferJSON.replacer);
+    const data = JSON.parse(serialized);
+    const { error } = await supabase
+      .from("whatsapp_auth")
+      .upsert({ id, data }, { onConflict: "id" });
+    if (error) throw new Error(`Supabase auth save failed for ${id}: ${error.message}`);
   };
 
   const readData = async (id) => {
-    try {
-      const { data, error } = await supabase
-        .from("whatsapp_auth")
-        .select("data")
-        .eq("id", id)
-        .maybeSingle();
-
-      if (error || !data || !data.data) return null;
-      return JSON.parse(JSON.stringify(data.data), BufferJSON.reviver);
-    } catch (err) {
-      console.error(`Supabase read error for ${id}:`, err);
-      return null;
-    }
+    const { data, error } = await supabase
+      .from("whatsapp_auth")
+      .select("data")
+      .eq("id", id)
+      .maybeSingle();
+    if (error) throw new Error(`Supabase auth read failed for ${id}: ${error.message}`);
+    if (!data || data.data == null) return null;
+    return JSON.parse(JSON.stringify(data.data), BufferJSON.reviver);
   };
 
   const removeData = async (id) => {
-    try {
-      await supabase.from("whatsapp_auth").delete().eq("id", id);
-    } catch (err) {
-      console.error(`Supabase remove error for ${id}:`, err);
-    }
+    const { error } = await supabase.from("whatsapp_auth").delete().eq("id", id);
+    if (error) throw new Error(`Supabase auth delete failed for ${id}: ${error.message}`);
   };
 
-  // 1. Load creds from Supabase or initialize new ones
+  // Do not silently create a fresh identity if the database is unavailable.
+  // That behavior can make an existing linked device appear to have logged out.
   const storedCreds = await readData("creds");
-  const creds = storedCreds ? JSON.parse(JSON.stringify(storedCreds), BufferJSON.reviver) : initAuthCreds();
+  const creds = storedCreds || initAuthCreds();
 
   return {
     state: {
@@ -53,38 +53,21 @@ export async function useSupabaseAuthState() {
       keys: {
         get: async (type, ids) => {
           const result = {};
-          await Promise.all(
-            ids.map(async (id) => {
-              let value = await readData(`${type}-${id}`);
-              if (value) {
-                result[id] = JSON.parse(JSON.stringify(value), BufferJSON.reviver);
-              }
-            })
-          );
+          // Keep reads simple and deterministic; Baileys requests small key batches.
+          for (const id of ids) result[id] = await readData(`${type}-${id}`);
           return result;
         },
         set: async (data) => {
-          const tasks = [];
-          for (const category in data) {
-            for (const id in data[category]) {
+          for (const category of Object.keys(data)) {
+            for (const id of Object.keys(data[category] || {})) {
               const value = data[category][id];
-              const keyName = `${category}-${id}`;
-              if (value) {
-                const serialized = JSON.stringify(value, BufferJSON.replacer);
-                tasks.push(writeData(keyName, JSON.parse(serialized)));
-              } else {
-                tasks.push(removeData(keyName));
-              }
+              if (value) await writeData(`${category}-${id}`, value);
+              else await removeData(`${category}-${id}`);
             }
           }
-          await Promise.all(tasks);
         },
       },
     },
-    // 2. Ensure creds are strictly saved to Supabase whenever updated
-    saveCreds: async () => {
-      const serializedCreds = JSON.stringify(creds, BufferJSON.replacer);
-      await writeData("creds", JSON.parse(serializedCreds));
-    },
+    saveCreds: async () => writeData("creds", creds),
   };
 }
